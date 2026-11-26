@@ -1,0 +1,245 @@
+# 环球电台直播目录 v2 — 中国（蜻蜓 HLS ADTS 64k）+ 国际（HLS AAC，TS 或 ADTS）
+# fields: group	name	sub	source (qt:<qingting_id> or https://...m3u8)
+中国 · 北京	北京新闻广播	北京 · 新闻	qt:339
+中国 · 北京	北京交通广播	北京 · 交通	qt:336
+中国 · 北京	北京文艺广播	北京 · 文艺	qt:333
+中国 · 北京	北京音乐广播	北京 · 音乐	qt:332
+中国 · 北京	北京城市广播	北京 · 都市	qt:345
+中国 · 上海	上海新闻广播	上海 · 新闻	qt:270
+中国 · 上海	第一财经广播	上海 · 经济	qt:276
+中国 · 上海	上海流行音乐LoveRadio	上海 · 音乐	qt:273
+中国 · 上海	上海动感101	上海 · 音乐	qt:274
+中国 · 上海	上海交通广播电台	上海 · 交通	qt:266
+中国 · 上海	上海戏曲广播	上海 · 戏曲	qt:269
+中国 · 上海	长三角之声	上海 · 综合	qt:275
+中国 · 上海	上海经典947	上海 · 综合	qt:267
+中国 · 浙江	FM93浙江交通之声	杭州 · 交通	qt:4522
+中国 · 浙江	杭州交通91.8电台	杭州 · 交通	qt:1133
+中国 · 浙江	浙江之声	杭州 · 综合	qt:4518
+中国 · 浙江	浙江FM99.6	杭州 · 综合	qt:4521
+中国 · 浙江	西湖之声	杭州 · 综合	qt:1163
+中国 · 浙江	嘉兴交通广播	嘉兴 · 交通	qt:1135
+中国 · 浙江	浙江音乐调频	杭州 · 音乐	qt:4866
+中国 · 浙江	浙江经济广播	杭州 · 经济	qt:4519
+中国 · 浙江	FM103.5湖州经济广播	湖州 · 经济	qt:2812
+中国 · 浙江	嘉兴综合广播	嘉兴 · 综合	qt:1154
+中国 · 江苏	江苏新闻广播	南京 · 新闻	qt:4944
+中国 · 江苏	江苏经典流行音乐	南京 · 音乐	qt:4938
+中国 · 江苏	江苏交通广播	南京 · 交通	qt:4054
+中国 · 江苏	苏州音乐广播	苏州 · 音乐	qt:2803
+中国 · 江苏	苏州交通广播	苏州 · 交通	qt:2806
+中国 · 江苏	南京音乐广播	南京 · 音乐	qt:4963
+中国 · 江苏	苏州新闻广播	苏州 · 新闻	qt:2808
+中国 · 江苏	FM93.7无锡新闻综合广播	无锡 · 新闻	qt:2777
+中国 · 江苏	无锡梁溪之声	无锡 · 综合	qt:2782
+中国 · 江苏	徐州新闻综合广播	徐州 · 新闻	qt:4922
+中国 · 广东	广东珠江经济电台	广州 · 经济	qt:1259
+中国 · 广东	广东城市之声	广州 · 都市	qt:469
+中国 · 广东	投资传媒（股市广播）	广州 · 经济	qt:4847
+中国 · 广东	深圳先锋898	深圳 · 综合	qt:1270
+中国 · 广东	广东交通之声	广州 · 交通	qt:1262
+中国 · 广东	鹤山电台	江门 · 综合	qt:1286
+中国 · 广东	广州新闻电台	广州 · 新闻	qt:4848
+中国 · 广东	广东音乐之声	广州 · 音乐	qt:1260
+中国 · 广东	广州交通广播	广州 · 交通	qt:4955
+中国 · 广东	广东新闻广播	广州 · 新闻	qt:1254
+中国 · 华东	安徽综合广播	合肥 · 综合	qt:4919
+中国 · 华东	安徽交通广播	合肥 · 交通	qt:1949
+中国 · 华东	安徽音乐广播	合肥 · 音乐	qt:1947
+中国 · 华东	安庆综合广播	安庆 · 综合	qt:1965
+中国 · 华东	芜湖综合广播	芜湖 · 综合	qt:5029
+中国 · 华东	安徽生活广播	合肥 · 都市	qt:1948
+中国 · 华东	安徽戏曲广播	合肥 · 戏曲	qt:1952
+中国 · 华东	安徽老年广播	合肥 · 综合	qt:1951
+中国 · 华东	芜湖交通经济广播	芜湖 · 交通	qt:5027
+中国 · 华东	厦门音乐广播	厦门 · 音乐	qt:1739
+中国 · 华东	厦门综合广播	厦门 · 综合	qt:1737
+中国 · 华东	厦门交通旅游广播	厦门 · 交通	qt:1738
+中国 · 华东	福建经济广播	福州 · 经济	qt:1732
+中国 · 华东	福建987私家车广播	福州 · 都市	qt:1736
+中国 · 华东	福建交通广播	福州 · 交通	qt:1733
+中国 · 华东	江西音乐广播	江西 · 音乐	qt:1802
+中国 · 华东	江西新闻广播	南昌 · 新闻	qt:1809
+中国 · 华东	南昌交通广播	南昌 · 交通	qt:1804
+中国 · 华东	江西交通广播	南昌 · 交通	qt:1811
+中国 · 华东	FM94.5赣州交通音乐广播	赣州 · 交通	qt:4942
+中国 · 华东	济南新闻广播	济南 · 新闻	qt:1667
+中国 · 华东	济南经济广播	济南 · 经济	qt:1668
+中国 · 华东	都市101经济广播	临沂 · 经济	qt:3995
+中国 · 华东	青岛新闻广播	青岛 · 新闻	qt:1673
+中国 · 华东	济南交通广播	济南 · 交通	qt:1669
+中国 · 华东	青岛交通广播	青岛 · 交通	qt:1676
+中国 · 华东	济南故事广播	济南 · 故事	qt:1672
+中国 · 华东	临沂综合广播	临沂 · 综合	qt:3992
+中国 · 华北	河北新闻广播	石家庄 · 新闻	qt:1644
+中国 · 华北	河北音乐广播	石家庄 · 音乐	qt:1649
+中国 · 华北	河北交通广播	石家庄 · 交通	qt:1646
+中国 · 华北	邯郸新闻综合广播	邯郸 · 新闻	qt:5072
+中国 · 华北	石家庄新闻广播	石家庄 · 新闻	qt:1652
+中国 · 华北	邯郸交通广播	邯郸 · 交通	qt:3950
+中国 · 华北	FM107太原交通广播	太原 · 交通	qt:4900
+中国 · 华北	山西音乐广播	太原 · 音乐	qt:4932
+中国 · 华北	运城文艺广播	运城 · 文艺	qt:1191
+中国 · 华北	FM94.9包头综合广播	包头 · 综合	qt:1889
+中国 · 华北	内蒙古交通之声	呼和浩特 · 交通	qt:1884
+中国 · 华北	内蒙古新闻综合广播	呼和浩特 · 新闻	qt:1883
+中国 · 华北	赤峰综合广播	赤峰 · 综合	qt:1896
+中国 · 华北	包头交通广播	包头 · 交通	qt:1890
+中国 · 华北	内蒙古音乐之声	呼和浩特 · 音乐	qt:1886
+中国 · 华北	赤峰交通广播	赤峰 · 交通	qt:1899
+中国 · 华北	包头汽车音乐广播	包头 · 音乐	qt:1892
+中国 · 华北	内蒙古绿野之声广播	呼和浩特 · 综合	qt:1888
+中国 · 东北	大连体育广播	大连 · 体育	qt:1085
+中国 · 东北	沈阳都市广播	沈阳 · 都市	qt:1099
+中国 · 东北	沈阳交通广播FM98.6	沈阳 · 交通	qt:1101
+中国 · 东北	沈阳生活广播	沈阳 · 都市	qt:1102
+中国 · 东北	大连交通广播	大连 · 交通	qt:3997
+中国 · 东北	吉林新闻综合广播	长春 · 新闻	qt:4953
+中国 · 东北	长春交通之声	长春 · 交通	qt:4967
+中国 · 东北	吉林交通广播	长春 · 交通	qt:4945
+中国 · 东北	吉林资讯广播	长春 · 综合	qt:3978
+中国 · 东北	长春广播电视台 FM88.0	长春 · 综合	qt:4850
+中国 · 东北	吉林市交通台 FM939	吉林 · 交通	qt:1819
+中国 · 东北	吉林市广播电视台经济广播	吉林 · 经济	qt:1823
+中国 · 东北	吉林乡村广播	长春 · 乡村	qt:3977
+中国 · 东北	黑龙江交通广播	哈尔滨 · 交通	qt:4973
+中国 · 东北	哈尔滨音乐广播	哈尔滨 · 音乐	qt:839
+中国 · 东北	龙广都市女性台	哈尔滨 · 都市	qt:4968
+中国 · 东北	哈尔滨交通广播	哈尔滨 · 交通	qt:838
+中国 · 东北	龙广新闻台	哈尔滨 · 新闻	qt:4974
+中国 · 东北	黑龙江老年少儿广播	哈尔滨 · 少儿	qt:4972
+中国 · 东北	黑龙江音乐广播	哈尔滨 · 音乐	qt:4969
+中国 · 华中	郑州新闻广播	郑州 · 新闻	qt:1220
+中国 · 华中	怀旧好声音	郑州 · 音乐	qt:1223
+中国 · 华中	1042南阳新闻广播	南阳 · 新闻	qt:1213
+中国 · 华中	郑州交通广播	郑州 · 交通	qt:1211
+中国 · 华中	洛阳交通广播	洛阳 · 交通	qt:1227
+中国 · 华中	郑州经济广播	郑州 · 经济	qt:1221
+中国 · 华中	洛阳音乐广播	洛阳 · 音乐	qt:1226
+中国 · 华中	安阳交通广播	安阳 · 交通	qt:2138
+中国 · 华中	郑州音乐广播	郑州 · 音乐	qt:4921
+中国 · 华中	湖北之声	武汉 · 综合	qt:1303
+中国 · 华中	楚天交通广播	武汉 · 交通	qt:1291
+中国 · 华中	武汉经典音乐广播	武汉 · 音乐	qt:1297
+中国 · 华中	襄阳交通音乐广播	襄樊 · 交通	qt:1308
+中国 · 华中	湖北经典音乐广播	武汉 · 音乐	qt:1296
+中国 · 华中	襄阳之声	襄樊 · 综合	qt:1307
+中国 · 华中	武汉交通广播	武汉 · 交通	qt:4665
+中国 · 华中	黄石交通广播	黄石 · 交通	qt:3964
+中国 · 华中	长沙FM101.7城市之声	长沙 · 都市	qt:4237
+中国 · 华中	湖南交通频道	长沙 · 交通	qt:4879
+中国 · 华中	湖南金鹰955电台	长沙 · 综合	qt:4937
+中国 · 华中	FM102.2亲子智慧电台	长沙 · 少儿	qt:4930
+中国 · 华中	1061长沙交通广播	长沙 · 交通	qt:3967
+中国 · 华中	FM105.0长沙新闻广播	长沙 · 新闻	qt:4877
+中国 · 华南	FM950广西音乐台	南宁 · 音乐	qt:4875
+中国 · 华南	广西电台新闻910	南宁 · 新闻	qt:1753
+中国 · 华南	广西私家车930	南宁 · 都市	qt:1756
+中国 · 华南	广西970女主播电台	南宁 · 综合	qt:1754
+中国 · 华南	广西交通台	南宁 · 交通	qt:1758
+中国 · 华南	978玉林城市电台	玉林 · 都市	qt:1762
+中国 · 华南	桂林飞扬调频	桂林 · 综合	qt:1760
+中国 · 华南	海南新闻广播	海口 · 新闻	qt:1861
+中国 · 华南	海南交通广播	海口 · 交通	qt:4911
+中国 · 华南	海南音乐广播	海口 · 音乐	qt:4878
+中国 · 西南	938重庆私家车广播	重庆 · 都市	qt:1502
+中国 · 西南	重庆之声	重庆 · 综合	qt:1498
+中国 · 西南	重庆音乐广播	重庆 · 音乐	qt:647
+中国 · 西南	重庆交通广播	重庆 · 交通	qt:1500
+中国 · 西南	四川交通广播FM101.7	成都 · 交通	qt:4886
+中国 · 西南	四川新闻广播FM106.1	成都 · 新闻	qt:4906
+中国 · 西南	成都经济广播	成都 · 经济	qt:1121
+中国 · 西南	成都电台FM946	成都 · 综合	qt:4892
+中国 · 西南	四川城市之音	成都 · 都市	qt:1111
+中国 · 西南	成都交通文艺广播FM91.4	成都 · 交通	qt:4891
+中国 · 西南	贵阳综合广播	贵阳 · 综合	qt:1773
+中国 · 西南	黔西南FM107.9综合广播	黔西南布依族苗族自治州 · 综合	qt:5045
+中国 · 西南	FM954汽车音乐广播	昆明 · 音乐	qt:1936
+中国 · 西南	云南新闻广播	昆明 · 新闻	qt:1926
+中国 · 西南	云南交通之声	昆明 · 交通	qt:1928
+中国 · 西南	FM1008新闻综合广播	昆明 · 新闻	qt:1934
+中国 · 西南	FM105城市资讯	昆明 · 都市	qt:1937
+中国 · 西南	云南音乐广播	昆明 · 音乐	qt:1929
+中国 · 西南	红河之声	红河哈尼族彝族自治州 · 综合	qt:4033
+中国 · 西北	陕西新闻广播	西安 · 新闻	qt:1600
+中国 · 西北	陕西交通广播	西安 · 交通	qt:1601
+中国 · 西北	陕西农村广播	西安 · 乡村	qt:1602
+中国 · 西北	西安音乐广播	西安 · 音乐	qt:1612
+中国 · 西北	西安新闻广播	西安 · 新闻	qt:1610
+中国 · 西北	陕西音乐广播	西安 · 音乐	qt:4873
+中国 · 西北	唐诗电台	西安 · 文艺	qt:1603
+中国 · 西北	陕西青少广播·1055青春有我	西安 · 少儿	qt:4885
+中国 · 西北	甘肃交通广播	兰州 · 交通	qt:3939
+中国 · 西北	甘肃农村广播	兰州 · 乡村	qt:3941
+中国 · 西北	青海交通音乐	西宁 · 交通	qt:5009
+中国 · 西北	青海经济生活广播	西宁 · 经济	qt:5008
+中国 · 西北	宁夏交通广播	银川 · 交通	qt:1840
+中国 · 西北	新疆交通广播	乌鲁木齐 · 交通	qt:1910
+中国 · 西北	新疆新闻广播FM96.1	乌鲁木齐 · 新闻	qt:1902
+中国 · 西北	乌鲁木齐维吾尔语广播	乌鲁木齐 · 综合	qt:1923
+中国 · 西北	新疆929文化旅游广播	乌鲁木齐 · 旅游	qt:1909
+中国 · 西北	乌鲁木齐新闻广播	乌鲁木齐 · 新闻	qt:1918
+中国 · 西北	乌鲁木齐974交通广播	乌鲁木齐 · 交通	qt:1919
+中国 · 港澳台	香港电台第二台	香港 · 粤语/综合	https://rthkradio2-live.akamaized.net/hls/live/2040078/radio2/master.m3u8
+中国 · 港澳台	香港电台第三台	香港 · 英语/新闻	https://rthkradio3-live.akamaized.net/hls/live/2040079/radio3/master.m3u8
+中国 · 港澳台	香港电台第四台	香港 · 古典/英语	https://rthkradio4-live.akamaized.net/hls/live/2040080/radio4/master.m3u8
+中国 · 港澳台	香港电台第五台	香港 · 粤语/长者	https://rthkradio5-live.akamaized.net/hls/live/2040081/radio5/master.m3u8
+中国 · 港澳台	台湾之音 RTI	台湾 · 华语/国际	https://streamak0138.akamaized.net/live0138lh-mbm9/_definst_/rti3/chunklist.m3u8
+国际 · 亚洲	NHK 世界广播	日本 · 国际/新闻	https://nhkworld-radio.nhkworld.jp/hls/live/nhkworld-radio-media2/index.m3u8
+国际 · 亚洲	TRT 第一广播	土耳其 · 综合	https://rd-trtradyo1.medya.trt.com.tr/master_128.m3u8
+国际 · 亚洲	TRT 民谣台	土耳其 · 民谣	https://rd-trtturku.medya.trt.com.tr/master_128.m3u8
+国际 · 亚洲	TRT 古典台	土耳其 · 古典	https://rd-trtnagme.medya.trt.com.tr/master_128.m3u8
+国际 · 亚洲	越南之声 VOV1	越南 · 新闻	https://str.vov.gov.vn/vovlive/vov1vov5Vietnamese.sdp_aac/playlist.m3u8
+国际 · 亚洲	越南之声交通台	越南 · 交通	https://play.vovgiaothong.vn/live/gthn/playlist.m3u8
+国际 · 亚洲	泰国 MCOT 96.5	泰国 · 综合	https://live-org-01-cdn.mcot.net/radiocdn_edge/fm965.stream_aac/chunklist.m3u8
+国际 · 亚洲	朱拉隆功电台	泰国 · 教育/综合	https://media.curadio.chula.ac.th/live/liveradio128/playlist.m3u8
+国际 · 欧洲	BBC 世界服务	英国 · 国际/新闻	https://a.files.bbci.co.uk/ms6/live/3441A116-B12E-4D2F-ACA8-C1984642FA4B/audio/simulcast/hls/nonuk/audio_syndication_low_sbr_v1/aks/bbc_world_service.m3u8
+国际 · 欧洲	BBC 第一台	英国 · 流行	https://a.files.bbci.co.uk/ms6/live/3441A116-B12E-4D2F-ACA8-C1984642FA4B/audio/simulcast/hls/nonuk/audio_syndication_low_sbr_v1/aks/bbc_radio_one.m3u8
+国际 · 欧洲	BBC 第二台	英国 · 成人流行	https://a.files.bbci.co.uk/ms6/live/3441A116-B12E-4D2F-ACA8-C1984642FA4B/audio/simulcast/hls/nonuk/audio_syndication_low_sbr_v1/aks/bbc_radio_two.m3u8
+国际 · 欧洲	BBC 第三台	英国 · 古典/文化	https://a.files.bbci.co.uk/ms6/live/3441A116-B12E-4D2F-ACA8-C1984642FA4B/audio/simulcast/hls/nonuk/audio_syndication_low_sbr_v1/aks/bbc_radio_three.m3u8
+国际 · 欧洲	BBC 第四台	英国 · 新闻/谈话	https://a.files.bbci.co.uk/ms6/live/3441A116-B12E-4D2F-ACA8-C1984642FA4B/audio/simulcast/hls/nonuk/audio_syndication_low_sbr_v1/aks/bbc_radio_fourfm.m3u8
+国际 · 欧洲	BBC 第五台直播	英国 · 新闻/体育	https://a.files.bbci.co.uk/ms6/live/3441A116-B12E-4D2F-ACA8-C1984642FA4B/audio/simulcast/hls/nonuk/audio_syndication_low_sbr_v1/aks/bbc_radio_five_live.m3u8
+国际 · 欧洲	BBC 第六音乐台	英国 · 另类音乐	https://a.files.bbci.co.uk/ms6/live/3441A116-B12E-4D2F-ACA8-C1984642FA4B/audio/simulcast/hls/nonuk/audio_syndication_low_sbr_v1/aks/bbc_6music.m3u8
+国际 · 欧洲	BBC 亚洲网络	英国 · 南亚/音乐	https://a.files.bbci.co.uk/ms6/live/3441A116-B12E-4D2F-ACA8-C1984642FA4B/audio/simulcast/hls/nonuk/audio_syndication_low_sbr_v1/aks/bbc_asian_network.m3u8
+国际 · 欧洲	西德广播五台	德国 · 谈话/文化	https://wdr-radio.ard-mcdn.de/wdr/radio/wdr5/hls/master.m3u8
+国际 · 欧洲	西德广播三台	德国 · 古典/文化	https://wdrhf.akamaized.net/hls/live/2027994/wdr3/master.m3u8
+国际 · 欧洲	中德广播 Jump	德国 · 流行	https://mdr-radio-hls.akamaized.net/hls/live/2112904/mdr-284320-0-hls/index.m3u8
+国际 · 欧洲	黑森广播资讯台	德国 · 新闻	https://hlshrinfo.akamaized.net/hls/live/2016539/hrinfo/master.m3u8
+国际 · 欧洲	西班牙国家广播	西班牙 · 综合	https://rtvelivestream.rtve.es/rtvesec/rne/rne_r1_main.m3u8
+国际 · 欧洲	西班牙广播三台	西班牙 · 文化/音乐	https://rtvelivestream.rtve.es/rtvesec/rne/rne_r3_main.m3u8
+国际 · 欧洲	西班牙古典台	西班牙 · 古典	https://rtvelivestream.rtve.es/rtvesec/rne/rne_r2_main.m3u8
+国际 · 欧洲	意大利广播电台	意大利 · 意大利流行	https://radioitaliasmi.akamaized.net/hls/live/2093120/RISMI/master.m3u8
+国际 · 欧洲	RDS 音乐台	意大利 · 流行	https://stream.rds.radio/audio/rds.stream_aac64/chunklist.m3u8
+国际 · 欧洲	意大利广播古典台	意大利 · 古典	https://radiotreclassica-live.akamaized.net/hls/live/2032595/radiotreclassica/radiotreclassica/playlist.m3u8
+国际 · 欧洲	瑞典广播二台	瑞典 · 古典/文化	https://ljud2-cdn.sr.se/lc/p2/p2_128.pls
+国际 · 欧洲	瑞典广播四台马尔默	瑞典 · 地方/综合	https://ljud1-cdn.sr.se/lc/p4malm.m3u8
+国际 · 欧洲	挪威广播一台+	挪威 · 综合	https://nrk-live-radio-world.akamaized.net/p1pluss/muxed.m3u8?adap=audio&aco=aac
+国际 · 欧洲	挪威广播三台	挪威 · 流行	https://nrk-live-radio-world.akamaized.net/p3/muxed.m3u8?adap=audio&aco=aac
+国际 · 欧洲	挪威古典台	挪威 · 古典	https://nrk-live-radio-world.akamaized.net/klassisk/muxed.m3u8?adap=audio&aco=aac
+国际 · 欧洲	丹麦广播一台	丹麦 · 新闻/谈话	https://drliveradio2.akamaized.net/hls/live/2118698/p1/masterab.m3u8
+国际 · 欧洲	丹麦广播爵士台	丹麦 · 爵士	https://drliveradio2.akamaized.net/hls/live/2118698/p8/masterab.m3u8
+国际 · 欧洲	芬兰广播古典台	芬兰 · 古典	https://yleradiolive5.akamaized.net/hls/live/20000872/yleklassinen/master.m3u8
+国际 · 欧洲	芬兰广播一台	芬兰 · 综合	https://yleradiolive5.akamaized.net/hls/live/20000882/ylers-kajaani/256/variant.m3u8
+国际 · 欧洲	奥地利广播一台	奥地利 · 文化/古典	https://orf-live-oe1.mdn.ors.at/out/u/oe1/q3a/manifest.m3u8
+国际 · 欧洲	奥地利广播三台	奥地利 · 流行	https://orf-live-oe3.mdn.ors.at/out/u/oe3/q3a/manifest.m3u8
+国际 · 欧洲	爱尔兰广播一台	爱尔兰 · 综合	https://liveaudio.rte.ie/hls-radio/radio1/chunklist.m3u8
+国际 · 欧洲	爱尔兰 2FM	爱尔兰 · 流行	https://liveaudio.rte.ie/hls-radio/2fm/chunklist.m3u8
+国际 · 欧洲	爱尔兰 lyric fm	爱尔兰 · 古典	https://liveaudio.rte.ie/hls-radio/lyric/chunklist.m3u8
+国际 · 欧洲	葡萄牙广播一台	葡萄牙 · 综合	https://streaming-live.rtp.pt/liveradio/antena180a/chunklist.m3u8
+国际 · 欧洲	葡萄牙广播三台	葡萄牙 · 另类/文化	https://streaming-live.rtp.pt/liveradio/antena380a/playlist.m3u8
+国际 · 欧洲	葡萄牙 RDP 非洲台	葡萄牙 · 非洲/综合	https://streaming-live.rtp.pt/liveradio/rdpafrica80a/playlist.m3u8
+国际 · 美洲	加拿大广播一台多伦多	加拿大 · 综合/新闻	https://cbcradiolive.akamaized.net/hls/live/2041036/ES_R1ETR/master.m3u8
+国际 · 美洲	CBC 音乐台	加拿大 · 音乐	https://cbcradiolive.akamaized.net/hls/live/2041057/ES_R2ETR/master.m3u8
+国际 · 美洲	加拿大法语一台	加拿大 · 法语/综合	https://rcavliveaudio.akamaized.net/hls/live/2006635/P-2QMTL0_MTL/playlist.m3u8
+国际 · 美洲	加拿大法语音乐台	加拿大 · 法语/古典	https://rcavliveaudio.akamaized.net/hls/live/2006979/M-7QMTL0_MTL/master.m3u8
+国际 · 美洲	波士顿 WGBH	美国 · 新闻/文化	https://wgbh-hls.streamguys1.com/wgbh_hls/playlist.m3u8
+国际 · 美洲	佛罗里达 WUFT	美国 · 新闻	https://ais-sa1.streamon.fm/7647_48k.aac/playlist.m3u8
+国际 · 大洋洲与非洲	澳大利亚广播国家台	澳大利亚 · 新闻/文化	https://mediaserviceslive.akamaized.net/hls/live/2038318/rnnsw/index.m3u8
+国际 · 大洋洲与非洲	澳大利亚广播古典台	澳大利亚 · 古典	https://mediaserviceslive.akamaized.net/hls/live/2038316/classicfmnsw/index.m3u8
+国际 · 大洋洲与非洲	澳大利亚广播爵士台	澳大利亚 · 爵士	https://mediaserviceslive.akamaized.net/hls/live/2038319/abcjazz/index.m3u8
+国际 · 大洋洲与非洲	澳大利亚广播新闻台	澳大利亚 · 新闻	https://streaming.abc-cdn.net.au/audio/hls/newsradio.m3u8?source=web
+国际 · 大洋洲与非洲	澳大利亚广播国际台	澳大利亚 · 国际	https://streaming.abc-cdn.net.au/audio/hls/raeng.m3u8?source=web
+国际 · 大洋洲与非洲	澳大利亚 Double J	澳大利亚 · 音乐	https://streaming.abc-cdn.net.au/audio/hls/doublejnsw.m3u8?source=web
+国际 · 大洋洲与非洲	澳大利亚 triple j	澳大利亚 · 青年/音乐	https://streaming.abc-cdn.net.au/audio/hls/triplejnsw.m3u8?source=web
+国际 · 大洋洲与非洲	开普敦古典台	南非 · 古典	https://edge.iono.fm/xhls/fmr_live_high.m3u8
+国际 · 大洋洲与非洲	南非 Gagasi FM	南非 · 都市/音乐	https://streaming.fabrik.fm/gagasi/echocast/audio/low/index.m3u8
