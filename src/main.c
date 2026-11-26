@@ -114,6 +114,7 @@ static char live_seg[MAX_LIVE_SEG][512];
 static char live_seg_tmp[512];
 static int live_seg_count;
 static char live_cur[512];
+static char live_pl_url[768];
 static char live_base[800];
 static char live_url[768];
 static HAACDecoder live_dec;
@@ -126,6 +127,9 @@ static char live_note[128];
 static uint32_t live_fetch_ms, live_decode_ms;
 static uint32_t live_segs, live_frames, live_underruns;
 static uint32_t live_last_ui;
+static bool live_priming;
+static bool live_prime_resume;
+static uint32_t live_prime_ms, live_prime_t0, live_last_prime;
 static int live_fail_streak;
 static bool live_exit;
 static bool live_quit;
@@ -135,7 +139,7 @@ static uint32_t back_guard_until;
 
 static int px(int n) { return screen_w > 600 ? n * 5 / 4 : n; }
 
-#define APP_VERSION "0.6.1"
+#define APP_VERSION "0.6.2"
 
 static const char *T(const char *zh, const char *en) { return ui_en ? en : zh; }
 
@@ -1993,6 +1997,42 @@ static void live_wait(uint32_t ms) {
     live_poll();
 }
 
+/* Holds the output while the host ring fills. A fresh open and a starved
+ * buffer are the two moments that break up on a Bluetooth headset; the feed
+ * starts again only once a few seconds are queued. */
+static void live_start_prime(uint32_t target_ms, bool resume) {
+  if (target_ms == 0) {
+    char rn[40];
+    int route = bobo_audio_route(rn, sizeof(rn));
+    target_ms = route == BOBO_AUDIO_ROUTE_HEADSET ? 3500 : 2000;
+  }
+  live_prime_ms = target_ms;
+  live_prime_t0 = bobo_millis();
+  live_priming = true;
+  live_prime_resume = resume;
+  bobo_audio_pause(true);
+}
+
+/* Pulls the playlist forward while the ring is full, so the fetch at the end
+ * of the window never runs on an empty buffer. True when a segment after
+ * live_cur is listed. */
+static bool live_refresh_next(void) {
+  for (int tries = 0;
+       tries < 3 && !live_quit && !live_exit && !live_stop_req; tries++) {
+    size_t pl_len = 0;
+    uint32_t pl_ms = 0;
+    int pst = live_fetch(live_pl_url, &pl_len, &pl_ms);
+    live_fetch_ms = pl_ms;
+    if (pst == 200 && pl_len > 0) {
+      live_parse_playlist(pl_len);
+      int pos = live_find(live_cur);
+      if (pos >= 0 && pos + 1 < live_seg_count) return true;
+    }
+    if (tries < 2) live_wait(500);
+  }
+  return false;
+}
+
 static bool live_write_paced(const int16_t *buf, size_t frames, int ch) {
   size_t off = 0;
   while (off < frames) {
@@ -2000,17 +2040,40 @@ static bool live_write_paced(const int16_t *buf, size_t frames, int ch) {
     if (live_state == LV_INTERRUPTED) {
       if (!live_pump()) return false;
       if (live_quit || live_exit || live_stop_req) return false;
-      if (live_last_ui == 0 || bobo_millis() - live_last_ui >= 4000)
+      if (live_last_ui == 0 || bobo_millis() - live_last_ui >= 30000)
         live_draw(BOBO_REFRESH_FAST);
       bobo_delay(20);
       continue;
+    }
+    if (live_priming) {
+      uint32_t elapsed = bobo_millis() - live_prime_t0;
+      uint32_t buffered = bobo_audio_buffered_ms();
+      /* A paused output that accepts no frames must not keep us silent. */
+      if (buffered >= live_prime_ms || elapsed >= 2000 ||
+          (buffered == 0 && elapsed >= 400)) {
+        live_priming = false;
+        bobo_audio_pause(false);
+        if (live_prime_resume) live_state = LV_PLAYING;
+        live_prime_resume = false;
+        live_last_ui = 0;
+      }
     }
     size_t k = bobo_audio_write(buf + off * (size_t)ch, frames - off);
     if (!k) {
       if (!live_pump()) return false;
       if (live_quit || live_exit || live_stop_req) return false;
+      if (!live_priming && live_state == LV_PLAYING &&
+          bobo_audio_buffered_ms() == 0 &&
+          (uint32_t)(bobo_millis() - live_last_prime) >= 2000) {
+        live_last_prime = bobo_millis();
+        live_underruns++;
+        live_state = LV_BUFFERING;
+        live_start_prime(1500, true);
+        live_draw(BOBO_REFRESH_FAST);
+        continue;
+      }
       bobo_delay(20);
-      if (live_last_ui == 0 || bobo_millis() - live_last_ui >= 4000)
+      if (live_last_ui == 0 || bobo_millis() - live_last_ui >= 30000)
         live_draw(BOBO_REFRESH_FAST);
     } else {
       off += k;
@@ -2028,6 +2091,8 @@ static bool live_open_audio(int hz, int ch) {
              hz, ch);
     return false;
   }
+  bool rate_change = !live_audio || hz != live_hz;
+  bool was_playing = live_state == LV_PLAYING;
   int rc = bobo_audio_open((uint32_t)hz, ch);
   bobo_log("live: audio open rc=%d hz=%d ch=%d", rc, hz, ch);
   if (rc != BOBO_AUDIO_OK) {
@@ -2040,6 +2105,12 @@ static bool live_open_audio(int hz, int ch) {
   live_ch = ch;
   bobo_audio_set_volume(volume);
   if (bobo_capabilities() & BOBO_CAP_KEEP_AWAKE) bobo_keep_awake(true);
+  /* A channel-count change keeps the queued audio, so it needs no refill;
+     a sample-rate change drops it and must be primed again. */
+  if (rate_change) {
+    live_start_prime(0, was_playing);
+    if (was_playing) live_state = LV_BUFFERING;
+  }
   return true;
 }
 
@@ -2102,7 +2173,7 @@ static bool live_play_segment(const char *seg) {
       live_frames += (uint32_t)n;
     }
     got++;
-    if (live_state == LV_CONNECTING) {
+    if (live_state == LV_CONNECTING && !live_priming) {
       live_state = LV_PLAYING;
       live_note[0] = '\0';
       live_last_ui = 0;
@@ -2235,7 +2306,10 @@ static void live_draw(int refresh) {
   bobo_draw_text(BOBO_FONT_SMALL, side + px(17), y, buf, true, false);
   y += px(19);
   if (live_hz > 0) {
-    snprintf(buf, sizeof(buf), "%d Hz / %d ch · AAC", live_hz, live_ch);
+    char rn[40];
+    int route = bobo_audio_route(rn, sizeof(rn));
+    snprintf(buf, sizeof(buf), "%d Hz / %d ch · AAC · %s", live_hz, live_ch,
+             route == BOBO_AUDIO_ROUTE_HEADSET ? "BT" : "SPK");
     icon_speaker(side, y + px(2), px(11), true);
     bobo_draw_text(BOBO_FONT_SMALL, side + px(17), y, buf, true, false);
     y += px(19);
@@ -2337,7 +2411,6 @@ static int live_wait_fatal(void) {
   return live_exit ? 1 : 0;
 }
 
-static char live_pl_url[768];
 static int live_target;
 
 static void live_reset_decoder(void) {
@@ -2419,6 +2492,9 @@ static int live_run(int idx) {
   live_stop_req = false;
   live_start_req = false;
   live_audio = false;
+  live_priming = false;
+  live_prime_resume = false;
+  live_last_prime = 0;
   live_segs = live_frames = live_underruns = 0;
   live_fetch_ms = live_decode_ms = 0;
   live_hz = live_ch = 0;
@@ -2459,8 +2535,19 @@ static int live_run(int idx) {
     bool streaming = live_begin_stream();
     if (streaming) {
       while (!live_quit && !live_exit && !live_stop_req) {
-        if (live_audio && bobo_audio_buffered_ms() == 0) live_underruns++;
-
+        /* Refresh the window while the buffer is still full: the last listed
+         * segment is about to play, so the next URL is known before the
+         * buffer runs empty. */
+        if (live_audio && live_segs > 0 && live_target + 1 >= live_seg_count &&
+            live_fetch_ms < 3000 && bobo_audio_buffered_ms() >= 1200) {
+          char want[512];
+          snprintf(want, sizeof(want), "%s", live_seg[live_target]);
+          if (live_refresh_next()) {
+            int pos = live_find(want);
+            live_target =
+                pos >= 0 ? pos : (live_seg_count >= 2 ? live_seg_count - 2 : 0);
+          }
+        }
         if (!live_play_segment(live_seg[live_target])) {
           if (live_quit || live_exit || live_stop_req) break;
           live_fail_streak++;
@@ -2489,33 +2576,18 @@ static int live_run(int idx) {
         live_segs++;
         live_note[0] = '\0';
         if (live_state != LV_INTERRUPTED) live_state = LV_PLAYING;
-        if (live_last_ui == 0 || bobo_millis() - live_last_ui >= 4000)
+        if (live_last_ui == 0 || bobo_millis() - live_last_ui >= 30000)
           live_draw(BOBO_REFRESH_FAST);
 
         if (live_target + 1 < live_seg_count) {
           live_target++;
+        } else if (live_refresh_next()) {
+          int pos = live_find(live_cur);
+          live_target = pos >= 0 && pos + 1 < live_seg_count
+                            ? pos + 1
+                            : (live_seg_count > 0 ? live_seg_count - 1 : 0);
         } else {
-          bool advanced = false;
-          for (int tries = 0;
-               tries < 4 && !live_quit && !live_exit && !live_stop_req;
-               tries++) {
-            size_t pl_len = 0;
-            uint32_t pl_ms = 0;
-            int pst = live_fetch(live_pl_url, &pl_len, &pl_ms);
-            live_fetch_ms = pl_ms;
-            if (pst == 200 && pl_len > 0) {
-              live_parse_playlist(pl_len);
-              int pos = live_find(live_cur);
-              if (pos >= 0 && pos + 1 < live_seg_count) {
-                live_target = pos + 1;
-                advanced = true;
-                break;
-              }
-            }
-            live_wait(600);
-          }
-          if (!advanced)
-            live_target = live_seg_count > 0 ? live_seg_count - 1 : 0;
+          live_target = live_seg_count > 0 ? live_seg_count - 1 : 0;
         }
       }
     }
