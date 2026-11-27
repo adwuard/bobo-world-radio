@@ -39,14 +39,14 @@ enum {
   ACT_RECENT,
   ACT_LIVE_FAV,
   ACT_PAGE,
-  ACT_VOL_UP,
-  ACT_VOL_DOWN,
   ACT_LIVE,
   ACT_LIVE_FILTER,
   ACT_LIVE_GROUP,
   ACT_LIVE_STATION,
+  ACT_LIVE_PLAY,
   ACT_LIVE_STOP,
-  ACT_LIVE_TOGGLE,
+  ACT_LIVE_PREV,
+  ACT_LIVE_NEXT,
   ACT_LIVE_BACK,
   ACT_ABOUT,
   ACT_LANG_AUTO,
@@ -83,7 +83,6 @@ static bool ui_en;
 
 static char fav_live_raw[4096];
 static char recent_live_raw[640];
-static int volume = 70;
 static int live_filter; /* 0 all, 1 China, 2 international */
 
 static char last_ref[192];
@@ -130,16 +129,22 @@ static uint32_t live_last_ui;
 static bool live_priming;
 static bool live_prime_resume;
 static uint32_t live_prime_ms, live_prime_t0, live_last_prime;
+static uint32_t live_intr_t0;
+static int live_route = -1; /* sink the open output runs on; -1 unknown */
+static uint32_t live_route_ms;
+static bool live_wd_armed;
+static uint32_t live_wd_t0, live_wd_played;
 static int live_fail_streak;
 static bool live_exit;
 static bool live_quit;
 static bool live_stop_req;
 static bool live_start_req;
+static int live_tune; /* +1 next station, -1 previous, 0 idle */
 static uint32_t back_guard_until;
 
 static int px(int n) { return screen_w > 600 ? n * 5 / 4 : n; }
 
-#define APP_VERSION "0.6.2"
+#define APP_VERSION "0.8.1"
 
 static const char *T(const char *zh, const char *en) { return ui_en ? en : zh; }
 
@@ -381,6 +386,25 @@ static void icon_stop(int x, int y, int s, bool black) {
                        s * 56 / 100, s / 10, black);
 }
 
+/* Skip track: bar plus triangle, pointing forward or back. */
+static void icon_skip(int x, int y, int s, bool black, bool forward) {
+  int bar = s / 6;
+  if (bar < 2) bar = 2;
+  int tri = s * 3 / 5;
+  if (tri < 3) tri = 3;
+  if (forward) {
+    bobo_fill_rect(x + s - bar, y, bar, s, black);
+    int xs[3] = {x + s - bar - tri, x + s - bar - tri, x + s - bar};
+    int ys[3] = {y, y + s, y + s / 2};
+    fill_poly(xs, ys, 3, black);
+  } else {
+    bobo_fill_rect(x, y, bar, s, black);
+    int xs[3] = {x + bar + tri, x + bar + tri, x + bar};
+    int ys[3] = {y, y + s, y + s / 2};
+    fill_poly(xs, ys, 3, black);
+  }
+}
+
 static void icon_wave(int x, int y, int s, bool black) {
   static const int bars[4] = {35, 82, 100, 55};
   int bw = s / 6;
@@ -429,16 +453,6 @@ static void icon_star_outline(int x, int y, int s, bool black) {
   icon_star(x + (s - inner) / 2, y + (s - inner) / 2, inner, !black);
 }
 
-static void icon_speaker(int x, int y, int s, bool black) {
-  int xs[6] = {x + s * 8 / 100,  x + s * 30 / 100, x + s * 52 / 100,
-               x + s * 52 / 100, x + s * 30 / 100, x + s * 8 / 100};
-  int ys[6] = {y + s * 36 / 100, y + s * 36 / 100, y + s * 18 / 100,
-               y + s * 82 / 100, y + s * 64 / 100, y + s * 64 / 100};
-  fill_poly(xs, ys, 6, black);
-  icon_arc(x + s * 54 / 100, y + s / 2, s * 17 / 100, -60, 60, 1, black);
-  icon_arc(x + s * 54 / 100, y + s / 2, s * 29 / 100, -60, 60, 1, black);
-}
-
 static void icon_headphones(int x, int y, int s, bool black) {
   int cx = x + s / 2;
   icon_arc(cx, y + s * 50 / 100, s * 38 / 100, 180, 360, icon_lw(s), black);
@@ -483,51 +497,22 @@ static void icon_globe(int x, int y, int s, bool black) {
   bobo_draw_line(cx - hw, cy + dy, cx + hw, cy + dy, 1, black);
 }
 
-static void icon_info(int x, int y, int s, bool black) {
-  int cx = x + s / 2, cy = y + s / 2, r = s * 42 / 100;
-  if (r < 2) return;
-  fill_circle(cx, cy, r, black);
-  int d = s / 8;
-  if (d < 1) d = 1;
-  bobo_fill_rect(cx - d / 2, cy - r * 55 / 100, d, d, !black);
-  bobo_fill_rect(cx - d / 2, cy - r * 8 / 100, d, r * 62 / 100, !black);
-}
-
 static void icon_gh(int x, int y, int s, bool black) {
-  int cx = x + s / 2, cy = y + s * 56 / 100, r = s * 30 / 100;
-  int ax[3], ay[3];
-  ax[0] = cx - s * 30 / 100;
-  ay[0] = cy - s * 24 / 100;
-  ax[1] = cx - s * 26 / 100;
-  ay[1] = cy - s * 54 / 100;
-  ax[2] = cx - s * 6 / 100;
-  ay[2] = cy - s * 34 / 100;
-  fill_poly(ax, ay, 3, black);
-  int bx[3], by[3];
-  bx[0] = cx + s * 30 / 100;
-  by[0] = cy - s * 24 / 100;
-  bx[1] = cx + s * 26 / 100;
-  by[1] = cy - s * 54 / 100;
-  bx[2] = cx + s * 6 / 100;
-  by[2] = cy - s * 34 / 100;
-  fill_poly(bx, by, 3, black);
-  fill_circle(cx, cy, r, black);
-  int er = s * 5 / 100;
-  if (er < 1) er = 1;
-  fill_circle(cx - s * 11 / 100, cy - s * 2 / 100, er, !black);
-  fill_circle(cx + s * 11 / 100, cy - s * 2 / 100, er, !black);
-}
-
-static void icon_download(int x, int y, int s, bool black) {
   int cx = x + s / 2;
-  int w = icon_lw(s);
-  bobo_draw_line(cx, y + s * 10 / 100, cx, y + s * 62 / 100, w, black);
-  bobo_draw_line(cx, y + s * 62 / 100, cx - s * 20 / 100, y + s * 42 / 100, w,
-                 black);
-  bobo_draw_line(cx, y + s * 62 / 100, cx + s * 20 / 100, y + s * 42 / 100, w,
-                 black);
-  bobo_draw_line(x + s * 18 / 100, y + s * 84 / 100, x + s * 82 / 100,
-                 y + s * 84 / 100, w, black);
+  int cy = y + s * 60 / 100;
+  int r = s * 28 / 100;
+  /* Octocat head: two pointed ears flanking a round face. */
+  int lx[3] = {cx - r * 95 / 100, cx - r * 95 / 100, cx - r * 28 / 100};
+  int ly[3] = {cy - r * 30 / 100, cy - r * 150 / 100, cy - r * 92 / 100};
+  fill_poly(lx, ly, 3, black);
+  int rx[3] = {cx + r * 95 / 100, cx + r * 95 / 100, cx + r * 28 / 100};
+  int ry[3] = {cy - r * 30 / 100, cy - r * 150 / 100, cy - r * 92 / 100};
+  fill_poly(rx, ry, 3, black);
+  fill_circle(cx, cy, r, black);
+  int er = s * 6 / 100;
+  if (er < 1) er = 1;
+  fill_circle(cx - r * 40 / 100, cy - r * 8 / 100, er, !black);
+  fill_circle(cx + r * 40 / 100, cy - r * 8 / 100, er, !black);
 }
 
 static void draw_screw(int cx, int cy, int r) {
@@ -941,10 +926,6 @@ static void load_state(void) {
                      sizeof(recent_live_raw)) < 0)
     recent_live_raw[0] = '\0';
   char tmp[16];
-  if (bobo_state_get("vol", tmp, sizeof(tmp)) > 0) {
-    int v = atoi(tmp);
-    if (v >= 0 && v <= 100) volume = v;
-  }
   if (bobo_state_get("live_filter", tmp, sizeof(tmp)) > 0) {
     int f = atoi(tmp);
     if (f >= 0 && f <= 2) live_filter = f;
@@ -1078,13 +1059,13 @@ static void draw_live_row(const live_t *l, int idx, int x, int y, int w, int h,
   const int lh = bobo_line_height(BOBO_FONT_SMALL);
   draw_ellipsized(BOBO_FONT_BODY, x, y + px(8), w - px(star ? 40 : 8), l->name,
                   true, true);
-  draw_ellipsized(BOBO_FONT_SMALL, x, y + h - lh - px(8),
+  draw_ellipsized(BOBO_FONT_SMALL, x, y + h - lh - px(11),
                   w - px(star ? 96 : 64), l->sub, true, false);
   const char *live_lbl = T("直播 >", "LIVE >");
   int llw = text_w(BOBO_FONT_SMALL, live_lbl, false);
   int right = x + w - (star ? px(34) : 0);
-  draw_right(BOBO_FONT_SMALL, right, y + h - lh - px(8), live_lbl, true, false);
-  icon_play(right - llw - px(15), y + h - lh - px(7), px(10), true);
+  draw_right(BOBO_FONT_SMALL, right, y + h - lh - px(11), live_lbl, true, false);
+  icon_play(right - llw - px(15), y + h - lh - px(10), px(10), true);
   row_basics(x, y, w, h, ACT_LIVE_STATION, idx);
   if (star) {
     int s = px(15);
@@ -1123,54 +1104,46 @@ static const char *group_en_short(const char *zh);
 static void draw_home(void) {
   const int side = px(24);
   const int w = screen_w - 2 * side;
-  int y = bobo_draw_header(T("环球电台", "World Radio")) + px(10);
+  const int slh = bobo_line_height(BOBO_FONT_SMALL);
+  const int tlh = bobo_line_height(BOBO_FONT_TITLE);
+  int y = bobo_draw_header(T("环球电台", "World Radio")) + px(16);
 
-  int mast = px(100);
-  bobo_fill_rect(side, y, w, mast, true);
-  draw_spaced(BOBO_FONT_TITLE, side + px(16), y + px(14), "WORLD RADIO", px(3),
-              false, true);
-  bobo_draw_text(BOBO_FONT_SMALL, side + px(16), y + px(48),
-                 T("纯网络电台 / LIVE INTERNET RADIO",
-                   "LIVE INTERNET RADIO / WORLD"),
-                 false, false);
-  int about_w = px(86);
-  int about_x = side + w - px(12) - about_w;
+  /* Masthead: typography and rules instead of a black plate. */
+  draw_spaced(BOBO_FONT_TITLE, side, y, "WORLD RADIO", px(3), true, true);
   const char *about_lbl = T("关于 >", "ABOUT >");
-  int about_lh = bobo_line_height(BOBO_FONT_SMALL);
-  int about_ic = px(12);
-  int about_lw = text_w(BOBO_FONT_SMALL, about_lbl, false);
-  int about_gx = about_x + (about_w - (about_ic + px(5) + about_lw)) / 2;
-  bobo_draw_rect(about_x, y + px(10), about_w, px(34), 1, false);
-  icon_info(about_gx, y + px(10) + (px(34) - about_ic) / 2, about_ic, false);
-  bobo_draw_text(BOBO_FONT_SMALL, about_gx + about_ic + px(5),
-                 y + px(10) + (px(34) - about_lh) / 2, about_lbl, false, false);
-  add_hit(about_x, y + px(4), about_w, px(46), ACT_ABOUT, 0, 0);
-  bobo_draw_line(side + px(16), y + px(70), side + w - px(16), y + px(70), 1,
-                 false);
-  char counts[48];
-  snprintf(counts, sizeof(counts), "%d LIVE / %d GROUPS", live_count,
+  int about_w = text_w(BOBO_FONT_SMALL, about_lbl, false);
+  bobo_draw_text(BOBO_FONT_SMALL, side + w - about_w, y + (tlh - slh) / 2,
+                 about_lbl, true, true);
+  add_hit(side + w - about_w - px(12), y - px(8), about_w + px(12), px(34),
+          ACT_ABOUT, 0, 0);
+  y += tlh + px(10);
+
+  draw_spaced(BOBO_FONT_SMALL, side, y, "LIVE INTERNET RADIO", 1, true, true);
+  draw_right(BOBO_FONT_SMALL, side + w, y, "AAC · HLS", true, false);
+  y += px(22);
+  char meta[64];
+  snprintf(meta, sizeof(meta),
+           T("%d 台 · %d 个地区分组", "%d STATIONS · %d REGIONS"), live_count,
            live_group_count);
-  bobo_draw_text(BOBO_FONT_SMALL, side + px(16), y + mast - px(20), counts,
-                 false, false);
-  draw_right(BOBO_FONT_SMALL, side + w - px(16), y + mast - px(20), "AAC · HLS",
-             false, false);
-  y += mast + px(10);
+  bobo_draw_text(BOBO_FONT_SMALL, side, y, meta, true, false);
+  y += px(26);
+  bobo_draw_line(side, y, side + w, y, 1, true);
+  y += px(18);
 
   if (live_count > 0) {
-    int live_h = px(66);
-    bobo_fill_rect(side, y, w, live_h, true);
-    int live_block = px(50);
-    icon_broadcast(side + (live_block - px(28)) / 2,
-                   y + (live_h - px(28)) / 2, px(28), false);
-    bobo_draw_text(BOBO_FONT_BODY, side + live_block + px(12), y + px(8),
-                   T("直播电台", "Live radio"), false, true);
-    draw_spaced(BOBO_FONT_SMALL, side + live_block + px(12), y + px(38),
-                "LIVE RADIO / WORLD", 1, false, false);
+    int hero_h = px(62);
+    icon_broadcast(side + px(1), y + (hero_h - px(34)) / 2, px(34), true);
+    draw_ellipsized(BOBO_FONT_TITLE, side + px(50), y + px(7),
+                    w - px(50) - px(96), T("直播电台", "Live radio"), true,
+                    true);
+    draw_spaced(BOBO_FONT_SMALL, side + px(50), y + px(37),
+                "LIVE RADIO / WORLD", 1, true, false);
     char lc[24];
-    snprintf(lc, sizeof(lc), T("%d 台", "%d"), live_count);
-    draw_right(BOBO_FONT_SMALL, side + w - px(12), y + px(22), lc, false, true);
-    add_hit(side, y, w, live_h, ACT_LIVE, 0, 0);
-    y += live_h + px(8);
+    snprintf(lc, sizeof(lc), T("%d 台 >", "%d >"), live_count);
+    draw_right(BOBO_FONT_SMALL, side + w, y + px(22), lc, true, true);
+    add_hit(side, y, w, hero_h, ACT_LIVE, 0, 0);
+    bobo_draw_line(side, y + hero_h, side + w, y + hero_h, 1, true);
+    y += hero_h + px(20);
   }
 
   int last_live = last_live_index();
@@ -1178,31 +1151,260 @@ static void draw_home(void) {
     int ch = px(58);
     bobo_draw_rect(side, y, w, ch, 1, true);
     int block = px(44);
-    bobo_fill_rect(side, y, block, ch, true);
-    icon_headphones(side + (block - px(26)) / 2, y + (ch - px(26)) / 2,
+    bobo_fill_rect(side + px(1), y + px(1), block, ch - px(2), true);
+    icon_headphones(side + px(1) + (block - px(26)) / 2, y + (ch - px(26)) / 2,
                     px(26), false);
-    draw_ellipsized(BOBO_FONT_BODY, side + block + px(12), y + px(8),
-                    w - block - px(86), live[last_live].name, true, true);
+    draw_ellipsized(BOBO_FONT_BODY, side + block + px(16), y + px(9),
+                    w - block - px(94), live[last_live].name, true, true);
     char resume_sub[160];
     snprintf(resume_sub, sizeof(resume_sub), "%s · %s",
              ui_en ? live_group_en(live[last_live].group)
                    : live[last_live].group,
              T("上次收听", "LAST PLAYED"));
-    draw_ellipsized(BOBO_FONT_SMALL, side + block + px(12), y + px(34),
-                    w - block - px(86), resume_sub, true, false);
-    draw_right(BOBO_FONT_SMALL, side + w - px(12), y + px(20),
+    draw_ellipsized(BOBO_FONT_SMALL, side + block + px(16), y + px(35),
+                    w - block - px(94), resume_sub, true, false);
+    draw_right(BOBO_FONT_SMALL, side + w - px(14), y + px(21),
                T("继续 >", "RESUME >"), true, true);
     add_hit(side, y, w, ch, ACT_RESUME, 0, 0);
-    y += ch + px(10);
+    y += ch + px(22);
   }
 
-  icon_globe(side, y + px(1), px(13), true);
-  draw_spaced(BOBO_FONT_SMALL, side + px(17), y, "FILTER / REGIONS", px(2),
-              true, true);
-  char ft[32];
-  snprintf(ft, sizeof(ft), T("%d 个分组", "%d GROUPS"), live_group_count);
-  draw_right(BOBO_FONT_SMALL, side + w, y, ft, true, false);
+  draw_spaced(BOBO_FONT_SMALL, side, y, "REGIONS", px(2), true, true);
+  draw_right(BOBO_FONT_SMALL, side + w, y, T("全部 >", "ALL >"), true, false);
+  add_hit(side + w - px(60), y - px(4), px(60), px(22), ACT_LIVE, 0, 0);
   y += px(24);
+
+  const char *flabels[3] = {T("全部", "ALL"), T("中国", "CHINA"),
+                            T("国际", "WORLD")};
+  int fcounts[3] = {live_count, live_group_stations(1), live_group_stations(2)};
+  int gap = px(8);
+  int bw = (w - 2 * gap) / 3;
+  int bh = px(44);
+  for (int i = 0; i < 3; i++) {
+    int bx = side + i * (bw + gap);
+    bool sel = live_filter == i;
+    char label[48];
+    snprintf(label, sizeof(label), "%s %d", flabels[i], fcounts[i]);
+    if (sel)
+      bobo_fill_round_rect(bx, y, bw, bh, px(3), true);
+    else
+      bobo_draw_round_rect(bx, y, bw, bh, 1, px(3), true);
+    bobo_draw_text(BOBO_FONT_SMALL,
+                   bx + (bw - text_w(BOBO_FONT_SMALL, label, true)) / 2,
+                   y + (bh - slh) / 2, label, !sel, true);
+    add_hit(bx, y, bw, bh, ACT_LIVE_FILTER, i, 0);
+  }
+  y += bh + px(16);
+
+  if (live_filter != 2) {
+    int cn_groups = 0;
+    for (int g = 0; g < live_group_count; g++)
+      if (live_group_is_cn(live_group_name[g])) cn_groups++;
+    int cc_h = px(58);
+    bobo_draw_rect(side, y, w, cc_h, 1, true);
+    icon_globe(side + px(13), y + (cc_h - px(22)) / 2, px(22), true);
+    bobo_draw_text(BOBO_FONT_BODY, side + px(47), y + px(9),
+                   T("中国", "China"), true, true);
+    char cnsub[48];
+    snprintf(cnsub, sizeof(cnsub), T("CHINA · %d 个地区", "CHINA · %d REGIONS"),
+             cn_groups);
+    draw_spaced(BOBO_FONT_SMALL, side + px(47), y + px(35), cnsub, 1, true,
+                false);
+    char cnc[24];
+    snprintf(cnc, sizeof(cnc), T("%d 台", "%d STATIONS"),
+             live_group_stations(1));
+    draw_right(BOBO_FONT_BODY, side + w - px(14),
+               y + (cc_h - bobo_line_height(BOBO_FONT_BODY)) / 2, cnc, true,
+               true);
+    add_hit(side, y, w, cc_h, ACT_LIVE_GROUP, -1, 0);
+    y += cc_h + px(10);
+  }
+
+  int qidx[MAX_LIVE_GROUPS], qn = 0;
+  for (int g = 0; g < live_group_count; g++) {
+    bool cn = live_group_is_cn(live_group_name[g]);
+    if (live_filter == 1 && !cn) continue;
+    if (live_filter == 2 && cn) continue;
+    qidx[qn++] = g;
+  }
+  int qgap = px(8);
+  int qtw = (w - qgap) / 2;
+  int qth = px(62);
+  int qrows = screen_h > 900 ? 4 : 2;
+  for (int i = 0; i < qrows * 2 && i < qn; i++) {
+    int g = qidx[i];
+    int x = side + (i % 2) * (qtw + qgap);
+    int ty = y + (i / 2) * (qth + qgap);
+    bobo_draw_rect(x, ty, qtw, qth, 1, true);
+    int chip_w = px(34);
+    int chip_y = ty + px(9);
+    int chip_h = qth - px(18);
+    bobo_fill_rect(x + px(8), chip_y, chip_w, chip_h, true);
+    char num[16];
+    snprintf(num, sizeof(num), "%02d", i + 1);
+    bobo_draw_text(
+        BOBO_FONT_SMALL,
+        x + px(8) + (chip_w - text_w(BOBO_FONT_SMALL, num, true)) / 2,
+        chip_y + (chip_h - slh) / 2, num, false, true);
+    char shortn[48];
+    group_short_name(live_group_name[g], shortn, sizeof(shortn));
+    draw_ellipsized(BOBO_FONT_BODY, x + px(50), ty + px(9), qtw - px(60),
+                    ui_en ? group_en_short(live_group_name[g]) : shortn, true,
+                    true);
+    char qsub[32];
+    snprintf(qsub, sizeof(qsub), T("%d 台", "%d STATIONS"), live_group_n[g]);
+    draw_ellipsized(BOBO_FONT_SMALL, x + px(50), ty + px(36), qtw - px(60),
+                    qsub, true, false);
+    add_hit(x, ty, qtw, qth, ACT_LIVE_GROUP, g, 0);
+  }
+  y += qrows * qth + (qrows - 1) * qgap + px(24);
+
+  int fav_n = 0;
+  for (int i = 0; i < live_count; i++)
+    if (live_is_fav(i)) fav_n++;
+  int ri[8];
+  int rec_n = recent_live_indices(ri, 8);
+  int small_h = px(58);
+  int small_w = (w - gap) / 2;
+  for (int i = 0; i < 2; i++) {
+    int x = side + i * (small_w + gap);
+    bobo_draw_rect(x, y, small_w, small_h, 1, true);
+    draw_spaced(BOBO_FONT_SMALL, x + px(11), y + px(8),
+                i == 0 ? "FAVORITES" : "RECENT", 1, true, false);
+    if (i == 0)
+      icon_star(x + small_w - px(11) - px(13), y + px(7), px(13), true);
+    else
+      icon_clock(x + small_w - px(11) - px(13), y + px(7), px(13), true);
+    bobo_draw_text(BOBO_FONT_BODY, x + px(11), y + px(31),
+                   i == 0 ? T("收藏", "Favorites") : T("最近播放", "Recent"),
+                   true, true);
+    char cnt[16];
+    snprintf(cnt, sizeof(cnt), "%d", i == 0 ? fav_n : rec_n);
+    draw_right(BOBO_FONT_BODY, x + small_w - px(11), y + px(31), cnt, true,
+               false);
+    add_hit(x, y, small_w, small_h, i == 0 ? ACT_FAVS : ACT_RECENT, 0, 0);
+  }
+
+  draw_ruler(side, screen_h - px(46), w, 24);
+  draw_center_col(BOBO_FONT_SMALL, screen_h - px(32),
+                  T("点按进入 / 返回键退出", "TAP TO OPEN / BACK TO EXIT"), true,
+                  false);
+}
+
+static void draw_list_page(int kind) {
+  const int side = px(24);
+  const int w = screen_w - 2 * side;
+  const char *title =
+      kind == PG_FAVS ? T("收藏", "Favorites") : T("最近播放", "Recent");
+  const char *en = kind == PG_FAVS ? "FAVORITES" : "RECENTLY PLAYED";
+  int y = bobo_draw_header(title) + px(16);
+
+  int indices[MAX_LIVE], total = 0;
+  if (kind == PG_FAVS)
+    total = live_fav_indices(indices, MAX_LIVE);
+  else
+    total = recent_live_indices(indices, MAX_LIVE);
+
+  /* Editorial header: label, count and one rule instead of a black band. */
+  if (kind == PG_FAVS)
+    icon_star(side + w - px(30), y - px(4), px(30), true);
+  else
+    icon_clock(side + w - px(30), y - px(4), px(30), true);
+  draw_spaced(BOBO_FONT_SMALL, side, y, en, px(2), true, true);
+  y += px(24);
+  char big[32];
+  if (kind == PG_FAVS)
+    snprintf(big, sizeof(big), T("%d 个收藏", "%d SAVED"), total);
+  else
+    snprintf(big, sizeof(big), T("%d 条记录", "%d IN HISTORY"), total);
+  bobo_draw_text(BOBO_FONT_TITLE, side, y, big, true, true);
+  y += bobo_line_height(BOBO_FONT_TITLE) + px(8);
+  bobo_draw_text(BOBO_FONT_SMALL, side, y,
+                 kind == PG_FAVS
+                     ? T("本地保存 · 在电台列表点星标即可收藏",
+                         "Saved on device · star a station to add it")
+                     : T("按播放顺序排列 · 最多保存 8 条",
+                         "Newest first · up to 8 kept"),
+                 true, false);
+  y += px(22);
+  bobo_draw_line(side, y, side + w, y, 1, true);
+  y += px(14);
+
+  int row_h = px(64);
+  int bottom = screen_h - px(54);
+  int rows = (bottom - y) / row_h;
+  if (rows < 3) rows = 3;
+  page_rows = rows;
+  page_total = total;
+  if (list_first >= total) list_first = total > rows ? total - rows : 0;
+  if (list_first < 0) list_first = 0;
+
+  if (total == 0) {
+    if (kind == PG_FAVS)
+      draw_empty_box(y, px(84), T("还没有收藏的电台。", "No favorites yet."),
+                     T("在电台列表点右侧星标即可收藏。",
+                       "Tap the star on any live station row."),
+                     NULL);
+    else
+      draw_empty_box(y, px(84), T("还没有播放记录。", "Nothing played yet."),
+                     T("从直播列表选一个电台开始收听。",
+                       "Pick a live station to start listening."),
+                     NULL);
+  } else {
+    int drawn = 0;
+    for (int i = list_first; i < total && drawn < rows; i++, drawn++)
+      draw_live_row(&live[indices[i]], indices[i], side, y + drawn * row_h, w,
+                    row_h, true);
+  }
+  draw_pager(ACT_PAGE, list_first, rows, total, screen_h - px(48));
+}
+
+static void group_short_name(const char *group, char *out, size_t cap) {
+  const char *sep = strstr(group, "· ");
+  snprintf(out, cap, "%s", sep ? sep + 3 : group);
+}
+
+static const char *group_en_short(const char *zh) {
+  static char buf[48];
+  const char *en = live_group_en(zh);
+  const char *sep = strstr(en, " / ");
+  if (sep)
+    snprintf(buf, sizeof(buf), "%.*s", (int)(sep - en), en);
+  else
+    snprintf(buf, sizeof(buf), "%s", en);
+  return buf;
+}
+
+static void draw_live_groups(void) {
+  const int side = px(24);
+  const int w = screen_w - 2 * side;
+  int y = bobo_draw_header(T("直播电台", "Live radio")) + px(16);
+
+  int idx[MAX_LIVE_GROUPS], total = 0;
+  for (int g = 0; g < live_group_count; g++) {
+    bool cn = live_group_is_cn(live_group_name[g]);
+    if (live_filter == 1 && !cn) continue;
+    if (live_filter == 2 && cn) continue;
+    idx[total++] = g;
+  }
+
+  icon_antenna(side + w - px(34), y - px(4), px(34), true);
+  draw_spaced(BOBO_FONT_SMALL, side, y, "LIVE DIRECTORY", 1, true, true);
+  y += px(24);
+  const char *sel_zh[3] = {"全部地区", "中国", "国际"};
+  const char *sel_en[3] = {"ALL REGIONS", "CHINA", "WORLD"};
+  draw_spaced(BOBO_FONT_TITLE, side, y,
+              ui_en ? sel_en[live_filter] : sel_zh[live_filter], px(2), true,
+              true);
+  y += bobo_line_height(BOBO_FONT_TITLE) + px(6);
+  char sub[64];
+  snprintf(sub, sizeof(sub), T("%d 台 / %d 个分组", "%d STATIONS / %d GROUPS"),
+           live_group_stations(live_filter), total);
+  bobo_draw_text(BOBO_FONT_SMALL, side, y, sub, true, false);
+  draw_right(BOBO_FONT_SMALL, side + w, y, "AAC 64K", true, false);
+  y += px(22);
+  bobo_draw_line(side, y, side + w, y, 1, true);
+  y += px(14);
 
   const char *flabels[3] = {T("全部", "ALL"), T("中国", "CHINA"),
                             T("国际", "WORLD")};
@@ -1225,229 +1427,10 @@ static void draw_home(void) {
                    y + (bh - lh) / 2, label, !sel, true);
     add_hit(bx, y, bw, bh, ACT_LIVE_FILTER, i, 0);
   }
-  y += bh + px(12);
-
-  int qidx[MAX_LIVE_GROUPS], qn = 0;
-  for (int g = 0; g < live_group_count; g++) {
-    bool cn = live_group_is_cn(live_group_name[g]);
-    if (live_filter == 1 && !cn) continue;
-    if (live_filter == 2 && cn) continue;
-    qidx[qn++] = g;
-  }
-  icon_broadcast(side, y + px(1), px(13), true);
-  draw_spaced(BOBO_FONT_SMALL, side + px(17), y, "QUICK REGIONS", px(2), true,
-              true);
-  draw_right(BOBO_FONT_SMALL, side + w, y, T("全部 >", "ALL >"), true, false);
-  add_hit(side, y - px(4), w, px(22), ACT_LIVE, 0, 0);
-  y += px(24);
-
-  int qgap = px(8);
-  int qtw = (w - qgap) / 2;
-  int qth = px(58);
-  int qrows = screen_h > 900 ? 3 : 2;
-  for (int i = 0; i < qrows * 2 && i < qn; i++) {
-    int g = qidx[i];
-    int x = side + (i % 2) * (qtw + qgap);
-    int ty = y + (i / 2) * (qth + qgap);
-    bobo_draw_rect(x, ty, qtw, qth, 1, true);
-    int chip_w = px(34);
-    int chip_y = ty + px(9);
-    int chip_h = qth - px(18);
-    bobo_fill_rect(x + px(8), chip_y, chip_w, chip_h, true);
-    char num[16];
-    snprintf(num, sizeof(num), "%02d", i + 1);
-    int lh_small = bobo_line_height(BOBO_FONT_SMALL);
-    bobo_draw_text(
-        BOBO_FONT_SMALL,
-        x + px(8) + (chip_w - text_w(BOBO_FONT_SMALL, num, true)) / 2,
-        chip_y + (chip_h - lh_small) / 2, num, false, true);
-    char shortn[48];
-    group_short_name(live_group_name[g], shortn, sizeof(shortn));
-    draw_ellipsized(BOBO_FONT_BODY, x + px(50), ty + px(7), qtw - px(60),
-                    ui_en ? group_en_short(live_group_name[g]) : shortn, true,
-                    true);
-    char qsub[32];
-    snprintf(qsub, sizeof(qsub), T("%d 台", "%d STATIONS"), live_group_n[g]);
-    draw_ellipsized(BOBO_FONT_SMALL, x + px(50), ty + px(33), qtw - px(60),
-                    qsub, true, false);
-    add_hit(x, ty, qtw, qth, ACT_LIVE_GROUP, g, 0);
-  }
-  y += qrows * qth + (qrows - 1) * qgap + px(12);
-
-  int fav_n = 0;
-  for (int i = 0; i < live_count; i++)
-    if (live_is_fav(i)) fav_n++;
-  int ri[8];
-  int rec_n = recent_live_indices(ri, 8);
-  int small_h = px(54);
-  int small_w = (w - gap) / 2;
-  for (int i = 0; i < 2; i++) {
-    int x = side + i * (small_w + gap);
-    bobo_draw_rect(x, y, small_w, small_h, 1, true);
-    draw_spaced(BOBO_FONT_SMALL, x + px(10), y + px(6),
-                i == 0 ? "FAVORITES" : "RECENT", 1, true, false);
-    if (i == 0)
-      icon_star(x + small_w - px(10) - px(13), y + px(5), px(13), true);
-    else
-      icon_clock(x + small_w - px(10) - px(13), y + px(5), px(13), true);
-    bobo_draw_text(BOBO_FONT_BODY, x + px(10), y + px(26),
-                   i == 0 ? T("收藏", "Favorites") : T("最近播放", "Recent"),
-                   true, true);
-    char cnt[16];
-    snprintf(cnt, sizeof(cnt), "%d", i == 0 ? fav_n : rec_n);
-    draw_right(BOBO_FONT_BODY, x + small_w - px(10), y + px(26), cnt, true,
-               false);
-    add_hit(x, y, small_w, small_h, i == 0 ? ACT_FAVS : ACT_RECENT, 0, 0);
-  }
-  y += small_h + px(12);
-
-  int tip_h = px(64);
-  bobo_draw_rect(side, y, w, tip_h, 1, true);
-  icon_wave(side + px(14), y + px(14), px(11), true);
-  draw_spaced(BOBO_FONT_SMALL, side + px(32), y + px(13), "LIVE ONLY", px(2),
-              true, true);
-  bobo_draw_text(BOBO_FONT_SMALL, side + px(14), y + px(34),
-                 T("HLS 分片直播 · 无点播、无广告",
-                   "HLS live segments / no on-demand"),
-                 true, false);
-  bobo_draw_text(BOBO_FONT_SMALL, side + px(14), y + px(48),
-                 T("停止后立即释放网络与扬声器",
-                   "Stop frees the network and speaker"),
-                 true, false);
-  y += tip_h + px(10);
-
-  draw_ruler(side, screen_h - px(46), w, 24);
-  draw_center_col(BOBO_FONT_SMALL, screen_h - px(32),
-                  T("点按进入 / 返回键退出", "TAP TO OPEN / BACK TO EXIT"), true,
-                  false);
-}
-
-static void draw_list_page(int kind) {
-  const int side = px(24);
-  const int w = screen_w - 2 * side;
-  const char *title =
-      kind == PG_FAVS ? T("收藏", "Favorites") : T("最近播放", "Recent");
-  const char *en = kind == PG_FAVS ? "FAVORITES" : "RECENTLY PLAYED";
-  int y = bobo_draw_header(title) + px(10);
-
-  int band = px(66);
-  bobo_fill_rect(side, y, w, band, true);
-  if (kind == PG_FAVS)
-    icon_star(side + w - px(14) - px(34), y + px(16), px(34), false);
-  else
-    icon_clock(side + w - px(14) - px(34), y + px(16), px(34), false);
-  draw_spaced(BOBO_FONT_TITLE, side + px(14), y + px(14), en, px(2), false,
-              true);
-  y += band + px(10);
-  draw_ruler(side, y, w, 24);
-  y += px(14);
-
-  int indices[MAX_LIVE], total = 0;
-  if (kind == PG_FAVS)
-    total = live_fav_indices(indices, MAX_LIVE);
-  else
-    total = recent_live_indices(indices, MAX_LIVE);
-
-  int row_h = px(64);
-  int bottom = screen_h - px(62);
-  int rows = (bottom - y) / row_h;
-  if (rows < 3) rows = 3;
-  page_rows = rows;
-  page_total = total;
-  if (list_first >= total) list_first = total > rows ? total - rows : 0;
-  if (list_first < 0) list_first = 0;
-
-  if (total == 0) {
-    if (kind == PG_FAVS)
-      draw_empty_box(y, px(120), T("还没有收藏的电台。", "No favorites yet."),
-                     T("在电台列表点右侧星标即可收藏。",
-                       "Tap the star on any live station row."),
-                     NULL);
-    else
-      draw_empty_box(y, px(120), T("还没有播放记录。", "Nothing played yet."),
-                     T("从直播列表选一个电台开始收听。",
-                       "Pick a live station to start listening."),
-                     NULL);
-  } else {
-    int drawn = 0;
-    for (int i = list_first; i < total && drawn < rows; i++, drawn++)
-      draw_live_row(&live[indices[i]], indices[i], side, y + drawn * row_h, w,
-                    row_h, true);
-  }
-  draw_pager(ACT_PAGE, list_first, rows, total, screen_h - px(56));
-}
-
-static void group_short_name(const char *group, char *out, size_t cap) {
-  const char *sep = strstr(group, "· ");
-  snprintf(out, cap, "%s", sep ? sep + 3 : group);
-}
-
-static const char *group_en_short(const char *zh) {
-  static char buf[48];
-  const char *en = live_group_en(zh);
-  const char *sep = strstr(en, " / ");
-  if (sep)
-    snprintf(buf, sizeof(buf), "%.*s", (int)(sep - en), en);
-  else
-    snprintf(buf, sizeof(buf), "%s", en);
-  return buf;
-}
-
-static void draw_live_groups(void) {
-  const int side = px(24);
-  const int w = screen_w - 2 * side;
-  int y = bobo_draw_header(T("直播电台", "Live radio")) + px(10);
-
-  int idx[MAX_LIVE_GROUPS], total = 0;
-  for (int g = 0; g < live_group_count; g++) {
-    bool cn = live_group_is_cn(live_group_name[g]);
-    if (live_filter == 1 && !cn) continue;
-    if (live_filter == 2 && cn) continue;
-    idx[total++] = g;
-  }
-
-  int band = px(84);
-  bobo_fill_rect(side, y, w, band, true);
-  icon_broadcast(side + w - px(14) - px(52), y + px(18), px(52), false);
-  bobo_draw_text(BOBO_FONT_SMALL, side + px(14), y + px(12), "LIVE DIRECTORY",
-                 false, false);
-  const char *sel_zh[3] = {"全部地区", "中国", "国际"};
-  const char *sel_en[3] = {"ALL REGIONS", "CHINA", "WORLD"};
-  draw_spaced(BOBO_FONT_TITLE, side + px(14), y + px(28),
-              ui_en ? sel_en[live_filter] : sel_zh[live_filter], px(2), false,
-              true);
-  char sub[64];
-  snprintf(sub, sizeof(sub), T("%d 台 / %d 个分组", "%d STATIONS / %d GROUPS"),
-           live_group_stations(live_filter), total);
-  bobo_draw_text(BOBO_FONT_SMALL, side + px(14), y + band - px(20), sub, false,
-                 false);
-  y += band + px(8);
-
-  const char *flabels[3] = {T("全部", "ALL"), T("中国", "CHINA"),
-                            T("国际", "WORLD")};
-  int fcounts[3] = {live_count, live_group_stations(1), live_group_stations(2)};
-  int gap = px(8);
-  int bw = (w - 2 * gap) / 3;
-  int bh = px(40);
-  for (int i = 0; i < 3; i++) {
-    int bx = side + i * (bw + gap);
-    bool sel = live_filter == i;
-    char label[48];
-    snprintf(label, sizeof(label), "%s %d", flabels[i], fcounts[i]);
-    if (sel)
-      bobo_fill_round_rect(bx, y, bw, bh, px(3), true);
-    else
-      bobo_draw_round_rect(bx, y, bw, bh, 1, px(3), true);
-    int lh = bobo_line_height(BOBO_FONT_SMALL);
-    bobo_draw_text(BOBO_FONT_SMALL,
-                   bx + (bw - text_w(BOBO_FONT_SMALL, label, true)) / 2,
-                   y + (bh - lh) / 2, label, !sel, true);
-    add_hit(bx, y, bw, bh, ACT_LIVE_FILTER, i, 0);
-  }
-  y += bh + px(12);
+  y += bh + px(16);
 
   int row_h = px(58);
-  int bottom = screen_h - px(62);
+  int bottom = screen_h - px(54);
   int rows = (bottom - y) / row_h;
   if (rows < 3) rows = 3;
   page_rows = rows;
@@ -1461,16 +1444,18 @@ static void draw_live_groups(void) {
     if (pos >= total) break;
     int g = idx[pos];
     int ry = y + i * row_h;
-    bobo_fill_rect(side, ry + px(6), px(38), row_h - px(18), true);
+    bobo_fill_rect(side, ry + px(7), px(38), row_h - px(16), true);
     char num[16];
     snprintf(num, sizeof(num), "%02d", pos + 1);
-    bobo_draw_text(BOBO_FONT_SMALL, side + px(7), ry + px(13), num, false,
-                   true);
+    int nch = row_h - px(16);
+    int nlh = bobo_line_height(BOBO_FONT_SMALL);
+    bobo_draw_text(BOBO_FONT_SMALL, side + px(7),
+                   ry + px(7) + (nch - nlh) / 2, num, false, true);
     bobo_draw_text(BOBO_FONT_BODY, side + px(50), ry + px(8),
                    ui_en ? live_group_en(live_group_name[g])
                          : live_group_name[g],
                    true, true);
-    draw_spaced(BOBO_FONT_SMALL, side + px(50), ry + px(32),
+    draw_spaced(BOBO_FONT_SMALL, side + px(50), ry + px(33),
                 ui_en ? live_group_name[g] : live_group_en(live_group_name[g]),
                 1, true, false);
     char cnt[24];
@@ -1483,36 +1468,35 @@ static void draw_live_groups(void) {
     bobo_draw_line(cx + px(1), cy, cx - px(3), cy + px(4), 1, true);
     row_basics(side, ry, w, row_h, ACT_LIVE_GROUP, g);
   }
-  draw_pager(ACT_PAGE, list_first, rows, total, screen_h - px(56));
+  draw_pager(ACT_PAGE, list_first, rows, total, screen_h - px(48));
 }
 
 static void draw_live_stations(int g) {
-  if (g < 0 || g >= live_group_count) g = 0;
+  if (g < -1 || g >= live_group_count) g = 0;
   const int side = px(24);
   const int w = screen_w - 2 * side;
-  const int first = live_group_first[g];
-  const int total = live_group_n[g];
-  int y = bobo_draw_header(T("直播电台", "Live radio")) + px(10);
+  const int first = g < 0 ? 0 : live_group_first[g];
+  const int total = g < 0 ? live_group_stations(1) : live_group_n[g];
+  const char *nzh = g < 0 ? "中国" : live_group_name[g];
+  const char *nen = g < 0 ? "CHINA" : live_group_en(live_group_name[g]);
+  int y = bobo_draw_header(T("直播电台", "Live radio")) + px(16);
 
-  int band = px(96);
-  bobo_fill_rect(side, y, w, band, true);
-  icon_antenna(side + w - px(14) - px(46), y + px(10), px(46), false);
-  bobo_draw_text(BOBO_FONT_SMALL, side + px(14), y + px(12), "LIVE RADIO",
-                 false, false);
-  draw_ellipsized(BOBO_FONT_TITLE, side + px(14), y + px(26), w - px(84),
-                  ui_en ? live_group_en(live_group_name[g])
-                        : live_group_name[g],
-                  false, true);
-  draw_spaced(BOBO_FONT_SMALL, side + px(14), y + px(62),
-              ui_en ? live_group_name[g] : live_group_en(live_group_name[g]), 1,
-              false, false);
+  icon_antenna(side + w - px(34), y - px(4), px(34), true);
+  draw_spaced(BOBO_FONT_SMALL, side, y, "LIVE RADIO", 1, true, true);
+  y += px(24);
+  draw_ellipsized(BOBO_FONT_TITLE, side, y, w - px(60), ui_en ? nen : nzh,
+                  true, true);
+  y += bobo_line_height(BOBO_FONT_TITLE) + px(6);
+  draw_spaced(BOBO_FONT_SMALL, side, y, ui_en ? nzh : nen, 1, true, false);
   char sub[48];
   snprintf(sub, sizeof(sub), T("%d 台 · AAC 直播", "%d · AAC LIVE"), total);
-  draw_right(BOBO_FONT_SMALL, side + w - px(14), y + px(62), sub, false, false);
-  y += band + px(8);
+  draw_right(BOBO_FONT_SMALL, side + w, y, sub, true, false);
+  y += px(22);
+  bobo_draw_line(side, y, side + w, y, 1, true);
+  y += px(14);
 
   int row_h = px(64);
-  int bottom = screen_h - px(62);
+  int bottom = screen_h - px(54);
   int rows = (bottom - y) / row_h;
   if (rows < 3) rows = 3;
   page_rows = rows;
@@ -1524,61 +1508,85 @@ static void draw_live_stations(int g) {
   for (int i = list_first; i < total && drawn < rows; i++, drawn++)
     draw_live_row(&live[first + i], first + i, side, y + drawn * row_h, w,
                   row_h, true);
-  draw_pager(ACT_PAGE, list_first, rows, total, screen_h - px(56));
+  draw_pager(ACT_PAGE, list_first, rows, total, screen_h - px(48));
 }
 
 static void draw_about(void) {
   const int side = px(24);
   const int w = screen_w - 2 * side;
-  int y = bobo_draw_header(T("关于", "About")) + px(10);
+  const int slh = bobo_line_height(BOBO_FONT_SMALL);
+  const int tlh = bobo_line_height(BOBO_FONT_TITLE);
+  int y = bobo_draw_header(T("关于", "About")) + px(16);
 
-  int band = px(92);
-  bobo_fill_rect(side, y, w, band, true);
-  icon_globe(side + w - px(14) - px(54), y + px(18), px(54), false);
-  bobo_draw_text(BOBO_FONT_SMALL, side + px(14), y + px(12), "ABOUT THIS APP",
-                 false, false);
+  icon_globe(side + w - px(46), y - px(3), px(46), true);
+  draw_spaced(BOBO_FONT_SMALL, side, y, "ABOUT THIS APP", px(2), true, true);
+  y += px(24);
   if (ui_en)
-    draw_spaced(BOBO_FONT_TITLE, side + px(14), y + px(28), "WORLD RADIO", px(2),
-                false, true);
+    draw_spaced(BOBO_FONT_TITLE, side, y, "WORLD RADIO", px(3), true, true);
   else
-    bobo_draw_text(BOBO_FONT_TITLE, side + px(14), y + px(28), "环球电台", false,
-                   true);
-  char sub[64];
-  snprintf(sub, sizeof(sub), "VERSION %s / API 6", APP_VERSION);
-  bobo_draw_text(BOBO_FONT_SMALL, side + px(14), y + band - px(20), sub, false,
-                 false);
-  y += band + px(10);
-
-  int desc_h = px(92);
-  bobo_draw_rect(side, y, w, desc_h, 1, true);
-  int dlh = bobo_line_height(BOBO_FONT_SMALL) + px(4);
-  draw_wrap(BOBO_FONT_SMALL,
-            T("墨水屏上的世界收音机：243 家网络电台、17 个地区分组，"
-              "HLS 分片续播，无点播、无广告。",
-              "A world radio for e-ink. 243 live internet stations in 17 "
-              "regions, streamed as HLS segments. No on-demand or ads."),
-            side + px(14), y + px(12), w - px(28), 3, dlh, false, true);
-  y += desc_h + px(10);
-
-  int build_h = px(76);
-  bobo_fill_rect(side, y, w, build_h, true);
-  icon_gh(side + px(16), y + px(22), px(32), false);
-  bobo_draw_text(BOBO_FONT_SMALL, side + px(60), y + px(10), "BUILD", false,
-                 false);
-  bobo_draw_text(BOBO_FONT_BODY, side + px(60), y + px(26),
-                 "Build by GitHub @adwuard", false, true);
-  bobo_draw_text(BOBO_FONT_SMALL, side + px(60), y + px(52),
-                 "github.com/adwuard", false, false);
-  y += build_h + px(12);
-
-  icon_globe(side, y + px(1), px(13), true);
-  draw_spaced(BOBO_FONT_SMALL, side + px(17), y, "LANGUAGE", px(2), true, true);
-  draw_right(BOBO_FONT_SMALL, side + w, y, T("语言", "LANGUAGE"), true, false);
+    bobo_draw_text(BOBO_FONT_TITLE, side, y, "环球电台", true, true);
+  y += tlh + px(8);
+  char ver[64];
+  snprintf(ver, sizeof(ver), "VERSION %s · API 6 · AAC/HLS", APP_VERSION);
+  bobo_draw_text(BOBO_FONT_SMALL, side, y, ver, true, false);
   y += px(22);
+  bobo_draw_line(side, y, side + w, y, 1, true);
+  y += px(18);
+
+  int nlh = slh + px(4);
+  char desc[256];
+  snprintf(desc, sizeof(desc),
+           T("墨水屏上的世界收音机：%d 家直播电台、%d 个地区分组，"
+             "HLS 分片续播，无点播、无广告。",
+             "A world radio for e-ink. %d live internet stations in %d "
+             "regions, streamed as HLS segments. No on-demand or ads."),
+           live_count, live_group_count);
+  y += draw_wrap(BOBO_FONT_SMALL, desc, side, y, w, 4, nlh, false, true) * nlh;
+  y += px(26);
+
+  draw_spaced(BOBO_FONT_SMALL, side, y, "LIVE CATALOG", px(2), true, true);
+  draw_right(BOBO_FONT_SMALL, side + w, y, "HLS / AAC-LC", true, false);
+  y += px(24);
+  int cw = w / 4;
+  char v0[16], v1[16];
+  snprintf(v0, sizeof(v0), "%d", live_count);
+  snprintf(v1, sizeof(v1), "%d", live_group_count);
+  const char *vals[4] = {v0, v1, "64k", "7s"};
+  const char *labs[4] = {T("电台", "STATIONS"), T("分组", "REGIONS"), "AAC-LC",
+                         T("分片", "HLS SEG")};
+  for (int i = 0; i < 4; i++) {
+    int cx = side + i * cw + cw / 2;
+    bobo_draw_text(BOBO_FONT_TITLE,
+                   cx - text_w(BOBO_FONT_TITLE, vals[i], true) / 2, y, vals[i],
+                   true, true);
+    bobo_draw_text(BOBO_FONT_SMALL,
+                   cx - text_w(BOBO_FONT_SMALL, labs[i], false) / 2,
+                   y + px(28), labs[i], true, false);
+    if (i > 0)
+      bobo_draw_line(side + i * cw, y - px(2), side + i * cw, y + px(46), 1,
+                     true);
+  }
+  y += px(54);
+  bobo_draw_line(side, y, side + w, y, 1, true);
+  y += px(24);
+
+  icon_gh(side, y - px(2), px(40), true);
+  draw_spaced(BOBO_FONT_SMALL, side + px(56), y, "BUILD", px(2), true, true);
+  bobo_draw_text(BOBO_FONT_BODY, side + px(56), y + px(17),
+                 "Built by @adwuard", true, true);
+  bobo_draw_text(BOBO_FONT_SMALL, side + px(56), y + px(41),
+                 "github.com/adwuard", true, false);
+  y += px(56);
+  bobo_draw_line(side, y, side + w, y, 1, true);
+  y += px(24);
+
+  draw_spaced(BOBO_FONT_SMALL, side, y, "LANGUAGE", px(2), true, true);
+  draw_right(BOBO_FONT_SMALL, side + w, y, T("语言", "LANGUAGE"), true, false);
+  y += px(24);
 
   int gap = px(8);
   int bw = (w - 2 * gap) / 3;
-  int bh = px(46);
+  int bh = px(48);
   const char *labels[3] = {T("跟随系统", "SYSTEM"), "中文", "English"};
   int modes[3] = {0, 1, 2};
   int blh = bobo_line_height(BOBO_FONT_SMALL);
@@ -1594,9 +1602,8 @@ static void draw_about(void) {
                    y + (bh - blh) / 2, labels[i], !sel, true);
     add_hit(bx, y, bw, bh, ACT_LANG_AUTO + i, 0, 0);
   }
-  y += bh + px(8);
+  y += bh + px(10);
 
-  int nlh = bobo_line_height(BOBO_FONT_SMALL) + px(3);
   if (lang_mode == 0)
     y += draw_wrap(BOBO_FONT_SMALL,
                    T("自动模式会跟随系统语言。当前 SDK 未提供系统语言接口，"
@@ -1606,12 +1613,24 @@ static void draw_about(void) {
                      "language above to override."),
                    side, y, w, 2, nlh, false, true) *
              nlh +
-         px(8);
+         px(14);
   else
-    y += nlh + px(8);
+    y += px(14);
+
+  draw_spaced(BOBO_FONT_SMALL, side, y, "PLAYER CONTROLS", px(2), true, true);
+  y += px(24);
+  bobo_draw_text(BOBO_FONT_SMALL, side, y,
+                 T("播放 / 停止 开始或停止直播 · 上一台 / 下一台 同分组换台",
+                   "PLAY / STOP start or stop · PREV / NEXT tune the region"),
+                 true, false);
+  bobo_draw_text(BOBO_FONT_SMALL, side, y + nlh,
+                 T("音量 跟随系统设置（侧键）· 返回 回到电台列表",
+                   "VOLUME follows the system · BACK returns to the list"),
+                 true, false);
+  y += nlh * 2 + px(14);
 
   draw_spaced(BOBO_FONT_SMALL, side, y, "CREDITS", px(2), true, true);
-  y += px(20);
+  y += px(22);
   draw_wrap(BOBO_FONT_SMALL,
             T("Helix AAC-LC (RPSL) · 直播目录来自各广播机构",
               "Helix AAC-LC (RPSL) · live catalogs from public broadcasters"),
@@ -1682,15 +1701,6 @@ static void draw_page(int refresh) {
       break;
   }
   present(refresh);
-}
-
-static void volume_step(int delta) {
-  volume += delta;
-  if (volume > 100) volume = 100;
-  if (volume < 0) volume = 0;
-  char vb[8];
-  snprintf(vb, sizeof(vb), "%d", volume);
-  bobo_state_set("vol", vb);
 }
 
 /* ---- live player -------------------------------------------------------- */
@@ -1930,15 +1940,7 @@ static bool live_handle_event(const bobo_event_t *ev) {
       live_draw(BOBO_REFRESH_HALF);
       break;
     case BOBO_EV_BUTTON:
-      if (ev->button == BOBO_BTN_BACK) {
-        live_quit = true;
-      } else if (ev->button == BOBO_BTN_UP || ev->button == BOBO_BTN_RIGHT ||
-                 ev->button == BOBO_BTN_DOWN || ev->button == BOBO_BTN_LEFT) {
-        bool up = ev->button == BOBO_BTN_UP || ev->button == BOBO_BTN_RIGHT;
-        volume_step(up ? 10 : -10);
-        if (live_audio) bobo_audio_set_volume(volume);
-        live_draw(BOBO_REFRESH_FAST);
-      }
+      if (ev->button == BOBO_BTN_BACK) live_quit = true;
       break;
     case BOBO_EV_TAP:
       live_tap(ev->x, ev->y);
@@ -1946,6 +1948,7 @@ static bool live_handle_event(const bobo_event_t *ev) {
     case BOBO_EV_AUDIO:
       if (ev->button == BOBO_AUDIO_EV_INTERRUPTED && live_on_air()) {
         live_state = LV_INTERRUPTED;
+        live_intr_t0 = bobo_millis();
         strcpy(live_note, T("语音助手正在使用扬声器，稍后自动继续。",
                             "The assistant has the speaker; listening resumes "
                             "when it is free."));
@@ -1955,6 +1958,8 @@ static bool live_handle_event(const bobo_event_t *ev) {
         if (bobo_audio_pause(false) == BOBO_AUDIO_OK) {
           live_state = LV_PLAYING;
           live_note[0] = '\0';
+          live_route = -1;
+          live_wd_armed = false;
         }
         live_draw(BOBO_REFRESH_FAST);
       }
@@ -1966,8 +1971,8 @@ static bool live_handle_event(const bobo_event_t *ev) {
 }
 
 /* Handles everything already queued without waiting. Called right after a
- * blocking fetch and between decoded frames so BACK, STOP and the volume
- * keys react within a frame even mid-segment. */
+ * blocking fetch and between decoded frames so BACK and STOP react within a
+ * frame even mid-segment. */
 static bool live_pump(void) {
   bobo_event_t ev;
   for (int n = 0; n < 64 && bobo_wait_event(&ev, 0); n++)
@@ -1992,9 +1997,92 @@ static void live_drain_input(void) {
 
 static void live_wait(uint32_t ms) {
   uint32_t end = bobo_millis() + ms;
-  while (!live_quit && !live_exit && !live_stop_req &&
+  while (!live_quit && !live_exit && !live_stop_req && !live_tune &&
          (int32_t)(end - bobo_millis()) > 0)
     live_poll();
+}
+
+/* Drops the old sink's queue and lets the next decoded frame reopen the
+ * output. A Bluetooth connect or disconnect reroutes the host stream and can
+ * leave it silent, so the queue, the format and the drop count start over. */
+static void live_restart_audio(const char *zh, const char *en) {
+  live_close_audio();
+  live_hz = live_ch = 0;
+  live_priming = false;
+  live_prime_resume = false;
+  live_last_prime = 0;
+  live_route = -1;
+  live_wd_armed = false;
+  live_underruns = 0;
+  live_state = LV_CONNECTING;
+  strcpy(live_note, T(zh, en));
+  live_last_ui = 0;
+  live_draw(BOBO_REFRESH_FAST);
+}
+
+/* The SDK sends no route event, so the sink is polled (4 Hz) while audio is
+ * open. Moving to or from a Bluetooth headset reroutes the host stream; the
+ * new sink also takes a moment to come up, so the change is debounced and
+ * then the output is reopened and primed from scratch. */
+static void live_watch_route(void) {
+  if (!live_audio || !live_on_air() || live_state == LV_INTERRUPTED) return;
+  uint32_t now = bobo_millis();
+  if (live_route >= 0 && (uint32_t)(now - live_route_ms) < 250) return;
+  live_route_ms = now;
+  char rn[40];
+  int r = bobo_audio_route(rn, sizeof(rn));
+  if (r != BOBO_AUDIO_ROUTE_SPEAKER && r != BOBO_AUDIO_ROUTE_HEADSET) return;
+  if (live_route < 0) {
+    live_route = r;
+    return;
+  }
+  if (r == live_route) return;
+
+  /* A2DP setup can make the route flap; wait until it holds still. */
+  int stable = 0;
+  for (int i = 0; i < 15; i++) {
+    if (live_quit || live_exit || live_stop_req || live_tune) return;
+    live_wait(100);
+    char nm[40];
+    int rr = bobo_audio_route(nm, sizeof(nm));
+    if (rr == r) {
+      if (++stable >= 3) break;
+    } else {
+      r = rr;
+      stable = 0;
+    }
+  }
+  if (live_quit || live_exit || live_stop_req || live_tune) return;
+  if (r == live_route ||
+      (r != BOBO_AUDIO_ROUTE_SPEAKER && r != BOBO_AUDIO_ROUTE_HEADSET))
+    return;
+  bobo_log("live: route %d -> %d", live_route, r);
+  live_route = r;
+  live_restart_audio("音频输出已切换，正在重新缓冲…",
+                     "Audio output changed, rebuffering...");
+}
+
+/* A rerouted sink can keep taking audio that is never heard; every other
+ * counter looks healthy. If the played position stands still for 4 s with
+ * audio still queued, reopen the output once. */
+static void live_watch_played(void) {
+  uint32_t now = bobo_millis();
+  if (!live_wd_armed) {
+    live_wd_armed = true;
+    live_wd_t0 = now;
+    live_wd_played = bobo_audio_played();
+    return;
+  }
+  if ((uint32_t)(now - live_wd_t0) < 4000) return;
+  uint32_t played = bobo_audio_played();
+  if (played != live_wd_played || bobo_audio_buffered_ms() == 0) {
+    live_wd_t0 = now;
+    live_wd_played = played;
+    return;
+  }
+  bobo_log("live: played stuck at %u, reopening output", (unsigned)played);
+  live_restart_audio("音频输出没有出声，正在重启…",
+                     "The output went silent; restarting audio...");
 }
 
 /* Holds the output while the host ring fills. A fresh open and a starved
@@ -2018,7 +2106,8 @@ static void live_start_prime(uint32_t target_ms, bool resume) {
  * live_cur is listed. */
 static bool live_refresh_next(void) {
   for (int tries = 0;
-       tries < 3 && !live_quit && !live_exit && !live_stop_req; tries++) {
+       tries < 3 && !live_quit && !live_exit && !live_stop_req && !live_tune;
+       tries++) {
     size_t pl_len = 0;
     uint32_t pl_ms = 0;
     int pst = live_fetch(live_pl_url, &pl_len, &pl_ms);
@@ -2036,10 +2125,25 @@ static bool live_refresh_next(void) {
 static bool live_write_paced(const int16_t *buf, size_t frames, int ch) {
   size_t off = 0;
   while (off < frames) {
-    if (live_quit || live_exit || live_stop_req) return false;
+    if (live_quit || live_exit || live_stop_req || live_tune) return false;
+    live_watch_route();
+    if (live_quit || live_exit || live_stop_req || live_tune) return false;
+    if (!live_audio) return true; /* restarted; the next frame reopens */
     if (live_state == LV_INTERRUPTED) {
       if (!live_pump()) return false;
-      if (live_quit || live_exit || live_stop_req) return false;
+      if (live_quit || live_exit || live_stop_req || live_tune) return false;
+      /* An interruption that never reports available would hold the stream
+         forever; try the speaker again every 6 s. */
+      if ((uint32_t)(bobo_millis() - live_intr_t0) >= 6000) {
+        live_intr_t0 = bobo_millis();
+        if (bobo_audio_pause(false) == BOBO_AUDIO_OK) {
+          live_state = LV_PLAYING;
+          live_note[0] = '\0';
+          live_route = -1;
+          live_wd_armed = false;
+          live_draw(BOBO_REFRESH_FAST);
+        }
+      }
       if (live_last_ui == 0 || bobo_millis() - live_last_ui >= 30000)
         live_draw(BOBO_REFRESH_FAST);
       bobo_delay(20);
@@ -2061,7 +2165,10 @@ static bool live_write_paced(const int16_t *buf, size_t frames, int ch) {
     size_t k = bobo_audio_write(buf + off * (size_t)ch, frames - off);
     if (!k) {
       if (!live_pump()) return false;
-      if (live_quit || live_exit || live_stop_req) return false;
+      if (live_quit || live_exit || live_stop_req || live_tune) return false;
+      /* A full ring whose position no longer moves is a dead sink too. */
+      if (!live_priming && live_state == LV_PLAYING) live_watch_played();
+      if (!live_audio) return true; /* restarted; the next frame reopens */
       if (!live_priming && live_state == LV_PLAYING &&
           bobo_audio_buffered_ms() == 0 &&
           (uint32_t)(bobo_millis() - live_last_prime) >= 2000) {
@@ -2077,6 +2184,7 @@ static bool live_write_paced(const int16_t *buf, size_t frames, int ch) {
         live_draw(BOBO_REFRESH_FAST);
     } else {
       off += k;
+      if (!live_priming && live_state == LV_PLAYING) live_watch_played();
     }
   }
   return true;
@@ -2094,6 +2202,14 @@ static bool live_open_audio(int hz, int ch) {
   bool rate_change = !live_audio || hz != live_hz;
   bool was_playing = live_state == LV_PLAYING;
   int rc = bobo_audio_open((uint32_t)hz, ch);
+  /* A sink that just appeared needs a moment; retry before the segment is
+     written off as failed. */
+  for (int i = 0; rc != BOBO_AUDIO_OK && i < 3; i++) {
+    bobo_log("live: audio open retry rc=%d", rc);
+    live_wait(400);
+    if (live_quit || live_exit || live_stop_req || live_tune) return false;
+    rc = bobo_audio_open((uint32_t)hz, ch);
+  }
   bobo_log("live: audio open rc=%d hz=%d ch=%d", rc, hz, ch);
   if (rc != BOBO_AUDIO_OK) {
     snprintf(live_note, sizeof(live_note),
@@ -2103,7 +2219,9 @@ static bool live_open_audio(int hz, int ch) {
   live_audio = true;
   live_hz = hz;
   live_ch = ch;
-  bobo_audio_set_volume(volume);
+  live_route = -1; /* adopt whichever sink this open landed on */
+  live_route_ms = bobo_millis();
+  live_wd_armed = false;
   if (bobo_capabilities() & BOBO_CAP_KEEP_AWAKE) bobo_keep_awake(true);
   /* A channel-count change keeps the queued audio, so it needs no refill;
      a sample-rate change drops it and must be primed again. */
@@ -2116,13 +2234,13 @@ static bool live_open_audio(int hz, int ch) {
 
 static bool live_play_segment(const char *seg) {
   if (!live_pump()) return false;
-  if (live_quit || live_exit || live_stop_req) return false;
+  if (live_quit || live_exit || live_stop_req || live_tune) return false;
   live_make_url(seg);
   size_t len = 0;
   uint32_t ms = 0;
   int st = live_fetch(live_url, &len, &ms);
   live_fetch_ms = ms;
-  if (live_quit || live_exit || live_stop_req) return false;
+  if (live_quit || live_exit || live_stop_req || live_tune) return false;
   if (st != 200 || len < 8) {
     snprintf(live_note, sizeof(live_note),
              T("分片下载失败：HTTP %d。", "Segment download failed: HTTP %d."),
@@ -2152,7 +2270,9 @@ static bool live_play_segment(const char *seg) {
   uint32_t dec_ms = 0;
   while (left > 7) {
     if (!live_pump()) return false;
-    if (live_quit || live_exit || live_stop_req) return false;
+    if (live_quit || live_exit || live_stop_req || live_tune) return false;
+    live_watch_route();
+    if (live_quit || live_exit || live_stop_req || live_tune) return false;
     uint32_t t0 = bobo_millis();
     int err = AACDecode(live_dec, &p, &left, live_pcm);
     dec_ms += bobo_millis() - t0;
@@ -2202,6 +2322,91 @@ static void live_channel_of(int idx, int *channel, int *total) {
   }
 }
 
+static void stat_labelled(int x, int y, const char *label, const char *value) {
+  bobo_draw_text(BOBO_FONT_SMALL, x, y, label, true, false);
+  bobo_draw_text(BOBO_FONT_SMALL,
+                 x + text_w(BOBO_FONT_SMALL, label, false) + px(7), y, value,
+                 true, true);
+}
+
+/* Transport bar: previous station, play, stop, next station. The key that
+ * applies right now is inverted, so the bar always shows one primary action. */
+static void draw_transport(int x, int y, int w, int h) {
+  bool playing = live_on_air();
+  int seg = w / 4;
+  int acts[4] = {ACT_LIVE_PREV, ACT_LIVE_PLAY, ACT_LIVE_STOP, ACT_LIVE_NEXT};
+  bool filled[4] = {false, !playing, playing, false};
+  const char *zh[4] = {"上一台", "播放", "停止", "下一台"};
+  const char *en[4] = {"PREV", "PLAY", "STOP", "NEXT"};
+  int lh = bobo_line_height(BOBO_FONT_SMALL);
+  int ic = px(13);
+  for (int i = 0; i < 4; i++) {
+    int bx = x + i * seg;
+    int bw = i == 3 ? w - 3 * seg : seg;
+    if (filled[i]) bobo_fill_rect(bx + 1, y + 1, bw - 1, h - 2, true);
+    const char *label = ui_en ? en[i] : zh[i];
+    int lw = text_w(BOBO_FONT_SMALL, label, filled[i]);
+    int gx = bx + (bw - (ic + px(7) + lw)) / 2;
+    int mid = y + h / 2;
+    bool ink = !filled[i];
+    if (i == 0)
+      icon_skip(gx, mid - ic / 2, ic, ink, false);
+    else if (i == 1)
+      icon_play(gx, mid - ic / 2, ic, ink);
+    else if (i == 2)
+      icon_stop(gx, mid - ic / 2, ic, ink);
+    else
+      icon_skip(gx, mid - ic / 2, ic, ink, true);
+    bobo_draw_text(BOBO_FONT_SMALL, gx + ic + px(7), mid - lh / 2 + px(1),
+                   label, ink, filled[i]);
+    add_hit(bx, y, bw, h, acts[i], 0, 0);
+  }
+  bobo_draw_rect(x, y, w, h, 2, true);
+  for (int i = 1; i < 4; i++)
+    bobo_draw_line(x + seg * i, y + 1, x + seg * i, y + h - 2, 1, true);
+}
+
+/* Which stations the prev/next keys will reach, shown on either side so tuning
+ * is not a blind jump. Both halves are tap targets too. */
+static void draw_tune_strip(int x, int y, int w, int h) {
+  int half = w / 2;
+  int g = live_group_of(live_idx);
+  int first = live_group_first[g];
+  int n = live_group_n[g];
+  int prev = live_idx, next = live_idx;
+  if (live_idx >= 0 && n > 1) {
+    int pos = live_idx - first;
+    prev = first + (pos - 1 + n) % n;
+    next = first + (pos + 1) % n;
+  }
+  bobo_draw_rect(x, y, w, h, 1, true);
+  bobo_draw_line(x + half, y + 1, x + half, y + h - 2, 1, true);
+  int lh = bobo_line_height(BOBO_FONT_BODY);
+  int slh = bobo_line_height(BOBO_FONT_SMALL);
+  int ty = y + (h - lh) / 2;
+  int ic = px(12);
+  int iy = y + (h - ic) / 2;
+  const char *cap_prev = T("上一台", "PREV");
+  int capw = text_w(BOBO_FONT_SMALL, cap_prev, false);
+  icon_skip(x + px(10), iy, ic, true, false);
+  bobo_draw_text(BOBO_FONT_SMALL, x + px(10) + ic + px(5), y + (h - slh) / 2,
+                 cap_prev, true, false);
+  int name_x = x + px(10) + ic + px(5) + capw + px(8);
+  draw_ellipsized(BOBO_FONT_BODY, name_x, ty, x + half - px(8) - name_x,
+                  prev >= 0 ? live[prev].name : "", true, true);
+  const char *cap_next = T("下一台", "NEXT");
+  int capn = text_w(BOBO_FONT_SMALL, cap_next, false);
+  int right_block = ic + px(5) + capn + px(10);
+  draw_ellipsized(BOBO_FONT_BODY, x + half + px(10), ty,
+                  w - half - right_block - px(18),
+                  next >= 0 ? live[next].name : "", true, true);
+  bobo_draw_text(BOBO_FONT_SMALL, x + w - px(10) - ic - px(5) - capn,
+                 y + (h - slh) / 2, cap_next, true, false);
+  icon_skip(x + w - px(10) - ic, iy, ic, true, true);
+  add_hit(x, y, half, h, ACT_LIVE_PREV, 0, 0);
+  add_hit(x + half, y, w - half, h, ACT_LIVE_NEXT, 0, 0);
+}
+
 static void live_draw(int refresh) {
   hit_count = 0;
   bobo_clear();
@@ -2216,9 +2421,9 @@ static void live_draw(int refresh) {
   bool aired = live_on_air();
   int y = bobo_draw_header(T("直播电台", "Live radio")) + px(8);
 
-  int card = px(268);
+  int card = px(screen_h > 900 ? 400 : 236);
   bobo_draw_rect(side, y, w, card, 2, true);
-  draw_spaced(BOBO_FONT_SMALL, side + px(14), y + px(11), "LIVE RECEIVER", 1,
+  draw_spaced(BOBO_FONT_SMALL, side + px(14), y + px(12), "LIVE RECEIVER", 1,
               true, true);
 
   const char *chip = "ON AIR";
@@ -2228,150 +2433,123 @@ static void live_draw(int refresh) {
     chip = "STANDBY";
   else if (live_state == LV_ERROR)
     chip = "NO SIGNAL";
-  int chip_w = text_w(BOBO_FONT_SMALL, chip, true) + px(18);
+  int chip_h = px(22);
+  int chip_w = text_w(BOBO_FONT_SMALL, chip, true) + px(20);
   int chip_x = side + w - px(14) - chip_w;
+  int chip_ty = y + px(9) + (chip_h - bobo_line_height(BOBO_FONT_SMALL)) / 2;
   if (aired) {
-    bobo_fill_round_rect(chip_x, y + px(8), chip_w, px(22), px(3), true);
-    bobo_draw_text(BOBO_FONT_SMALL, chip_x + px(9), y + px(11), chip, false,
+    bobo_fill_round_rect(chip_x, y + px(9), chip_w, chip_h, px(3), true);
+    bobo_draw_text(BOBO_FONT_SMALL, chip_x + px(10), chip_ty, chip, false,
                    true);
   } else {
-    bobo_draw_round_rect(chip_x, y + px(8), chip_w, px(22), 1, px(3), true);
-    bobo_draw_text(BOBO_FONT_SMALL, chip_x + px(9), y + px(11), chip, true,
-                   true);
+    bobo_draw_round_rect(chip_x, y + px(9), chip_w, chip_h, 1, px(3), true);
+    bobo_draw_text(BOBO_FONT_SMALL, chip_x + px(10), chip_ty, chip, true, true);
   }
 
-  draw_radio_art(side + w / 2, y + px(38), w, card - px(68), aired, channel,
+  draw_radio_art(side + w / 2, y + px(40), w, card - px(70), aired, channel,
                  total);
-  draw_center_col(BOBO_FONT_SMALL, y + card - px(21),
+  draw_center_col(BOBO_FONT_SMALL, y + card - px(27),
                   "HLS · AAC-LC 64K · 7 s SEGMENTS", true, false);
-  y += card + px(8);
+  y += card + px(10);
 
-  draw_ellipsized(BOBO_FONT_TITLE, side, y, w, name, true, true);
-  y += bobo_line_height(BOBO_FONT_TITLE) + px(2);
-  char line[192];
-  snprintf(line, sizeof(line), "%s · %s · CH %02d/%02d", sub, group, channel,
-           total);
-  draw_ellipsized(BOBO_FONT_SMALL, side, y, w, line, true, false);
-  y += bobo_line_height(BOBO_FONT_SMALL) + px(8);
-
+  /* Station identity: name and meta on the left, local clock on the right. */
   wall_clock_t clock;
   wall_clock(&clock);
   char hm[8], date[32];
   clock_hm(&clock, hm, sizeof(hm));
   clock_date(&clock, date, sizeof(date));
-  int clock_h = px(64);
-  bobo_draw_rect(side, y, w, clock_h, 1, true);
-  int split = side + w * 38 / 100;
-  bobo_draw_line(split, y, split, y + clock_h, 1, true);
-  icon_clock(side + px(14), y + px(11), px(18), true);
-  bobo_draw_text(BOBO_FONT_TITLE, side + px(38), y + px(7), hm, true, true);
-  bobo_draw_text(BOBO_FONT_SMALL, side + px(14), y + clock_h - px(19),
-                 T("本地时间 LOCAL", "LOCAL TIME"), true, false);
-  bobo_draw_text(BOBO_FONT_BODY, split + px(14), y + px(13), date, true, true);
-  bobo_draw_text(BOBO_FONT_SMALL, split + px(14), y + clock_h - px(19),
-                 T("今天 TODAY", "TODAY"), true, false);
-  y += clock_h + px(6);
+  int clock_w = px(118);
+  draw_ellipsized(BOBO_FONT_TITLE, side, y, w - clock_w - px(10), name, true,
+                  true);
+  draw_right(BOBO_FONT_TITLE, side + w, y, hm, true, true);
+  char line[192];
+  snprintf(line, sizeof(line), "%s · %s · CH %02d/%02d", sub, group, channel,
+           total);
+  draw_ellipsized(BOBO_FONT_SMALL, side, y + px(28), w - clock_w - px(10), line,
+                  true, false);
+  draw_right(BOBO_FONT_SMALL, side + w, y + px(28), date, true, false);
+  bobo_draw_line(side, y + px(50), side + w, y + px(50), 1, true);
+  y += px(58);
 
-  bobo_fill_round_rect(side, y + px(3), px(9), px(9), px(4),
+  int btn_h = px(56);
+  draw_transport(side, y, w, btn_h);
+  y += btn_h + px(10);
+
+  draw_tune_strip(side, y, w, px(46));
+  y += px(46) + px(14);
+
+  /* Signal: state, queue and the counters that explain a dropout. */
+  int sig_h = px(114);
+  bobo_draw_rect(side, y, w, sig_h, 1, true);
+  icon_wave(side + px(14), y + px(11), px(12), true);
+  draw_spaced(BOBO_FONT_SMALL, side + px(34), y + px(10), "SIGNAL", px(2), true,
+              true);
+  char route[64];
+  if (live_audio && live_hz > 0) {
+    char rn[40];
+    int r = bobo_audio_route(rn, sizeof(rn));
+    snprintf(route, sizeof(route), "%d Hz / %d ch · %s", live_hz, live_ch,
+             r == BOBO_AUDIO_ROUTE_HEADSET ? "BT" : "SPK");
+  } else {
+    snprintf(route, sizeof(route), "--");
+  }
+  draw_right(BOBO_FONT_SMALL, side + w - px(14), y + px(10), route, true, false);
+
+  int lx = side + px(14);
+  int c2 = side + w * 45 / 100;
+  int c3 = side + w * 74 / 100;
+  bobo_fill_round_rect(lx, y + px(37), px(9), px(9), px(4),
                        live_state == LV_PLAYING);
   if (live_state != LV_PLAYING)
-    bobo_draw_round_rect(side, y + px(3), px(9), px(9), 1, px(4), true);
-  bobo_draw_text(BOBO_FONT_BODY, side + px(16), y, live_state_label(), true,
-                 true);
-  char buf[96];
+    bobo_draw_round_rect(lx, y + px(37), px(9), px(9), 1, px(4), true);
+  bobo_draw_text(BOBO_FONT_BODY, lx + px(16), y + px(32), live_state_label(),
+                 true, true);
   if (live_audio) {
-    snprintf(buf, sizeof(buf), T("队列 %u ms", "BUFFER %u ms"),
+    char qb[48];
+    snprintf(qb, sizeof(qb), T("队列 %u ms", "BUFFER %u ms"),
              (unsigned)bobo_audio_buffered_ms());
-    draw_right(BOBO_FONT_SMALL, side + w, y + px(5), buf, true, false);
+    draw_right(BOBO_FONT_SMALL, side + w - px(14), y + px(36), qb, true, false);
   }
-  y += px(26);
-
   uint32_t played_ms = 0;
   if (live_audio && live_hz > 0)
     played_ms = (uint32_t)((uint64_t)bobo_audio_played() * 1000u /
                            (uint64_t)live_hz);
-  snprintf(buf, sizeof(buf),
-           T("已播 %02u:%02u · 分片 %u", "PLAYED %02u:%02u · SEG %u"),
-           (unsigned)(played_ms / 60000u),
-           (unsigned)(played_ms / 1000u % 60u), (unsigned)live_segs);
-  icon_wave(side, y + px(2), px(11), true);
-  bobo_draw_text(BOBO_FONT_SMALL, side + px(17), y, buf, true, false);
-  y += px(19);
-  snprintf(buf, sizeof(buf),
-           T("拉流 %u ms · 解码 %u ms · 欠载 %u",
-             "FETCH %u ms · DECODE %u ms · DROPS %u"),
-           (unsigned)live_fetch_ms, (unsigned)live_decode_ms,
-           (unsigned)live_underruns);
-  icon_download(side, y + px(2), px(11), true);
-  bobo_draw_text(BOBO_FONT_SMALL, side + px(17), y, buf, true, false);
-  y += px(19);
-  if (live_hz > 0) {
-    char rn[40];
-    int route = bobo_audio_route(rn, sizeof(rn));
-    snprintf(buf, sizeof(buf), "%d Hz / %d ch · AAC · %s", live_hz, live_ch,
-             route == BOBO_AUDIO_ROUTE_HEADSET ? "BT" : "SPK");
-    icon_speaker(side, y + px(2), px(11), true);
-    bobo_draw_text(BOBO_FONT_SMALL, side + px(17), y, buf, true, false);
-    y += px(19);
-  }
-  y += px(2);
+  char vb[48];
+  snprintf(vb, sizeof(vb), "%02u:%02u", (unsigned)(played_ms / 60000u),
+           (unsigned)(played_ms / 1000u % 60u));
+  stat_labelled(lx, y + px(62), T("已播", "PLAYED"), vb);
+  snprintf(vb, sizeof(vb), "%u", (unsigned)live_segs);
+  stat_labelled(c2, y + px(62), T("分片", "SEG"), vb);
+  snprintf(vb, sizeof(vb), "%u", (unsigned)live_underruns);
+  stat_labelled(c3, y + px(62), T("欠载", "DROPS"), vb);
+  snprintf(vb, sizeof(vb), "%u ms", (unsigned)live_fetch_ms);
+  stat_labelled(lx, y + px(86), T("拉流", "FETCH"), vb);
+  snprintf(vb, sizeof(vb), "%u ms", (unsigned)live_decode_ms);
+  stat_labelled(c2, y + px(86), T("解码", "DECODE"), vb);
+  y += sig_h;
 
   if (live_note[0]) {
-    int lh = bobo_line_height(BOBO_FONT_SMALL) + px(3);
-    int lines =
-        draw_wrap(BOBO_FONT_SMALL, live_note, side, y, w, 2, lh, true, false);
-    y += lines * lh + px(4);
+    int nlh = bobo_line_height(BOBO_FONT_SMALL) + px(4);
+    y += px(8);
+    y += draw_wrap(BOBO_FONT_SMALL, live_note, side, y, w, 2, nlh, true,
+                   true) *
+         nlh;
   }
-  y += px(2);
-
-  int vol_h = px(48);
-  char vbuf[48];
-  snprintf(vbuf, sizeof(vbuf), T("音量 VOLUME %d", "VOLUME %d"), volume);
-  icon_speaker(side, y + px(16), px(13), true);
-  bobo_draw_text(BOBO_FONT_SMALL, side + px(18), y + px(15), vbuf, true, false);
-  int bw = px(52);
-  int bx2 = side + w - bw;
-  int bx1 = bx2 - bw - px(8);
-  bobo_draw_rect(bx1, y, bw, vol_h, 1, true);
-  bobo_draw_rect(bx2, y, bw, vol_h, 1, true);
-  int lh = bobo_line_height(BOBO_FONT_BODY);
-  bobo_draw_text(BOBO_FONT_BODY,
-                 bx1 + (bw - text_w(BOBO_FONT_BODY, "-", true)) / 2,
-                 y + (vol_h - lh) / 2, "-", true, true);
-  bobo_draw_text(BOBO_FONT_BODY,
-                 bx2 + (bw - text_w(BOBO_FONT_BODY, "+", true)) / 2,
-                 y + (vol_h - lh) / 2, "+", true, true);
-  add_hit(bx1, y, bw, vol_h, ACT_VOL_DOWN, 0, 0);
-  add_hit(bx2, y, bw, vol_h, ACT_VOL_UP, 0, 0);
-  y += vol_h + px(8);
-
-  int btn_h = px(54);
-  bobo_fill_rect(side, y, w, btn_h, true);
-  const char *btn = aired ? T("停止收听 STOP", "STOP LISTENING")
-                          : T("开始收听 START", "START LISTENING");
-  int bic = px(16);
-  int btw = text_w(BOBO_FONT_BODY, btn, false);
-  int bix = side + (w - (bic + px(8) + btw)) / 2;
-  if (aired)
-    icon_stop(bix, y + (btn_h - bic) / 2, bic, false);
-  else
-    icon_play(bix, y + (btn_h - bic) / 2, bic, false);
-  bobo_draw_text(BOBO_FONT_BODY, bix + bic + px(8), y + (btn_h - lh) / 2, btn,
-                 false, true);
-  add_hit(side, y, w, btn_h, ACT_LIVE_TOGGLE, 0, 0);
-  y += btn_h + px(8);
 
   int back_h = px(48);
-  bobo_draw_rect(side, y, w, back_h, 1, true);
+  int back_y = screen_h - px(96);
+  if (back_y < y + px(12)) back_y = y + px(12);
+  bobo_draw_rect(side, back_y, w, back_h, 1, true);
   const char *back_lbl = T("返回列表 BACK", "BACK TO LIST");
   bobo_draw_text(BOBO_FONT_BODY,
                  side + (w - text_w(BOBO_FONT_BODY, back_lbl, true)) / 2,
-                 y + (back_h - lh) / 2, back_lbl, true, true);
-  add_hit(side, y, w, back_h, ACT_LIVE_BACK, 0, 0);
+                 back_y + (back_h - bobo_line_height(BOBO_FONT_BODY)) / 2,
+                 back_lbl, true, true);
+  add_hit(side, back_y, w, back_h, ACT_LIVE_BACK, 0, 0);
 
   draw_center_col(BOBO_FONT_SMALL, screen_h - px(28),
-                  T("侧键 / 点按 +/- 调音量", "SIDE KEYS / +/- FOR VOLUME"), true,
-                  false);
+                  T("音量跟随系统 · 点按换台", "SYSTEM VOLUME / TAP TO TUNE"),
+                  true, false);
   present(refresh);
   live_last_ui = bobo_millis();
 }
@@ -2383,24 +2561,28 @@ static void live_tap(int x, int y) {
     int action = hits[i].action;
     if (action == ACT_LIVE_BACK) {
       live_quit = true;
-    } else if (action == ACT_LIVE_TOGGLE) {
-      if (live_on_air()) {
-        live_stop_req = true;
-        live_close_audio();
-        live_state = LV_STOPPED;
-        live_note[0] = '\0';
-        live_draw(BOBO_REFRESH_FAST);
-      } else {
+    } else if (action == ACT_LIVE_PLAY) {
+      if (!live_on_air()) {
         live_start_req = true;
         live_state = LV_CONNECTING;
         strcpy(live_note, T("正在重新连接直播源...",
                             "Reconnecting to the live stream..."));
         live_draw(BOBO_REFRESH_FAST);
       }
-    } else if (action == ACT_VOL_UP || action == ACT_VOL_DOWN) {
-      volume_step(action == ACT_VOL_UP ? 10 : -10);
-      if (live_audio) bobo_audio_set_volume(volume);
-      live_draw(BOBO_REFRESH_FAST);
+    } else if (action == ACT_LIVE_STOP) {
+      if (live_on_air()) {
+        live_stop_req = true;
+        live_close_audio();
+        live_route = -1;
+        live_wd_armed = false;
+        live_priming = false;
+        live_prime_resume = false;
+        live_state = LV_STOPPED;
+        live_note[0] = '\0';
+        live_draw(BOBO_REFRESH_FAST);
+      }
+    } else if (action == ACT_LIVE_PREV || action == ACT_LIVE_NEXT) {
+      live_tune = action == ACT_LIVE_NEXT ? 1 : -1;
     }
     return;
   }
@@ -2416,6 +2598,52 @@ static int live_target;
 static void live_reset_decoder(void) {
   if (live_dec) AACFreeDecoder(live_dec);
   live_dec = AACInitDecoder();
+}
+
+/* Moves to the next/previous station inside the same group and rebuilds the
+ * stream state. Returns true when the player should keep streaming. */
+static bool live_switch_station(int dir) {
+  int g = live_group_of(live_idx);
+  int first = live_group_first[g];
+  int n = live_group_n[g];
+  if (n <= 1) return live_on_air();
+  int pos = (live_idx - first + dir + n) % n;
+  int ni = first + pos;
+  bool keep = live_on_air();
+  live_close_audio();
+  live_route = -1;
+  live_wd_armed = false;
+  live_priming = false;
+  live_prime_resume = false;
+  live_last_prime = 0;
+  live_idx = ni;
+  if (!strncmp(live[ni].source, "qt:", 3))
+    snprintf(live_pl_url, sizeof(live_pl_url),
+             "https://ls.qingting.fm/live/%s.m3u8?bitrate=64",
+             live[ni].source + 3);
+  else
+    snprintf(live_pl_url, sizeof(live_pl_url), "%s", live[ni].source);
+  url_set_base(live_pl_url);
+  live_reset_decoder();
+  live_segs = live_frames = live_underruns = 0;
+  live_fetch_ms = live_decode_ms = 0;
+  live_hz = live_ch = 0;
+  live_seg_count = 0;
+  live_cur[0] = '\0';
+  live_note[0] = '\0';
+  live_fail_streak = 0;
+  live_target = 0;
+  live_last_ui = 0;
+  if (keep) {
+    live_state = LV_CONNECTING;
+    strcpy(live_note, T("正在切换电台...", "Tuning the station..."));
+    bobo_state_set("resume_live", live[ni].source);
+  } else {
+    live_state = LV_STOPPED;
+    bobo_state_set("resume_live", "");
+  }
+  live_draw(BOBO_REFRESH_FAST);
+  return keep;
 }
 
 /* Fetch the (possibly master) playlist and choose the segment to start at.
@@ -2449,7 +2677,7 @@ static bool live_begin_stream(void) {
   uint32_t ms = 0;
   int st = 0;
   for (int tries = 0; tries < 3; tries++) {
-    if (live_quit || live_exit || live_stop_req) return false;
+    if (live_quit || live_exit || live_stop_req || live_tune) return false;
     st = live_fetch(live_pl_url, &len, &ms);
     if (st == 200 && len > 0) break;
     live_wait(800);
@@ -2460,13 +2688,14 @@ static bool live_begin_stream(void) {
            T("正在连接直播源...", "Connecting to the live stream..."));
     live_draw(BOBO_REFRESH_FAST);
     for (int tries = 0; tries < 3; tries++) {
-      if (live_quit || live_exit || live_stop_req) return false;
+      if (live_quit || live_exit || live_stop_req || live_tune) return false;
       st = live_fetch(live_pl_url, &len, &ms);
       if (st == 200 && len > 0) break;
       live_wait(800);
     }
     live_fetch_ms = ms;
   }
+  if (live_tune) return false;
   if (st == 200) live_parse_playlist(len);
   if (live_seg_count == 0) {
     live_state = LV_ERROR;
@@ -2495,6 +2724,10 @@ static int live_run(int idx) {
   live_priming = false;
   live_prime_resume = false;
   live_last_prime = 0;
+  live_intr_t0 = 0;
+  live_route = -1;
+  live_route_ms = 0;
+  live_wd_armed = false;
   live_segs = live_frames = live_underruns = 0;
   live_fetch_ms = live_decode_ms = 0;
   live_hz = live_ch = 0;
@@ -2505,6 +2738,7 @@ static int live_run(int idx) {
   live_last_ui = 0;
   live_fail_streak = 0;
   live_target = 0;
+  live_tune = 0;
 
   live_dec = AACInitDecoder();
   live_net = malloc(LIVE_NET_CAP);
@@ -2531,10 +2765,19 @@ static int live_run(int idx) {
 
   live_draw(BOBO_REFRESH_HALF);
 
+  bool want_play = true;
   for (;;) {
-    bool streaming = live_begin_stream();
+    if (live_tune) {
+      int dir = live_tune;
+      live_tune = 0;
+      want_play = live_switch_station(dir);
+      if (live_quit || live_exit) break;
+    }
+    bool streaming = want_play ? live_begin_stream() : false;
     if (streaming) {
-      while (!live_quit && !live_exit && !live_stop_req) {
+      while (!live_quit && !live_exit && !live_stop_req && !live_tune) {
+        live_watch_route();
+        if (live_quit || live_exit || live_stop_req || live_tune) break;
         /* Refresh the window while the buffer is still full: the last listed
          * segment is about to play, so the next URL is known before the
          * buffer runs empty. */
@@ -2549,7 +2792,7 @@ static int live_run(int idx) {
           }
         }
         if (!live_play_segment(live_seg[live_target])) {
-          if (live_quit || live_exit || live_stop_req) break;
+          if (live_quit || live_exit || live_stop_req || live_tune) break;
           live_fail_streak++;
           if (live_fail_streak >= 5) {
             live_state = LV_ERROR;
@@ -2570,12 +2813,13 @@ static int live_run(int idx) {
         live_fail_streak = 0;
         strcpy(live_cur, live_seg[live_target]);
         if (live_segs == 0) {
-          remember_live(idx);
-          recent_live_add(idx);
+          remember_live(live_idx);
+          recent_live_add(live_idx);
         }
         live_segs++;
-        live_note[0] = '\0';
-        if (live_state != LV_INTERRUPTED) live_state = LV_PLAYING;
+        if (live_audio) live_note[0] = '\0';
+        if (live_audio && live_state != LV_INTERRUPTED)
+          live_state = LV_PLAYING;
         if (live_last_ui == 0 || bobo_millis() - live_last_ui >= 30000)
           live_draw(BOBO_REFRESH_FAST);
 
@@ -2592,6 +2836,7 @@ static int live_run(int idx) {
       }
     }
     if (live_quit || live_exit) break;
+    if (live_tune) continue;
 
     if (live_stop_req) {
       live_stop_req = false;
@@ -2601,18 +2846,21 @@ static int live_run(int idx) {
       live_note[0] = '\0';
       live_draw(BOBO_REFRESH_FAST);
     }
+    want_play = false;
 
     /* Idle on the player page: the clock keeps ticking and START/BACK stay
      * responsive without any network or audio work. */
-    while (!live_quit && !live_exit && !live_start_req) {
+    while (!live_quit && !live_exit && !live_start_req && !live_tune) {
       live_poll();
       if (live_stop_req) live_stop_req = false;
       if (bobo_millis() - live_last_ui >= 30000) live_draw(BOBO_REFRESH_FAST);
       bobo_delay(30);
     }
     if (live_quit || live_exit) break;
+    if (live_tune) continue;
     live_start_req = false;
-    bobo_state_set("resume_live", live[idx].source);
+    want_play = true;
+    bobo_state_set("resume_live", live[live_idx].source);
 
     live_reset_decoder();
     if (!live_dec) {
@@ -2629,6 +2877,17 @@ static int live_run(int idx) {
     strcpy(live_note, T("正在重新连接直播源...",
                         "Reconnecting to the live stream..."));
     live_draw(BOBO_REFRESH_FAST);
+  }
+
+  /* Leave the station list scrolled to the station that played last. */
+  bool listed_here =
+      page_arg == -1 ? live_group_is_cn(live[live_idx].group)
+                     : page_arg == live_group_of(live_idx);
+  if (!live_exit && page == PG_LIVE_ST && live_idx >= 0 && page_rows > 0 &&
+      listed_here) {
+    int base = page_arg == -1 ? 0 : live_group_first[page_arg];
+    int pos = live_idx - base;
+    if (pos >= 0) list_first = (pos / page_rows) * page_rows;
   }
 
   bobo_log("live: stop segs=%u frames=%u underruns=%u", (unsigned)live_segs,
@@ -2654,7 +2913,7 @@ static bool valid_page(int p, int a) {
     case PG_ABOUT:
       return true;
     case PG_LIVE_ST:
-      return a >= 0 && a < live_group_count;
+      return a >= -1 && a < live_group_count;
     default:
       return false;
   }
