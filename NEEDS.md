@@ -143,3 +143,37 @@ A media-session model (the OS plays a URL or handle itself and reopens the app o
 ### Acceptance sketch
 
 Start a station and press HOME: audio continues uninterrupted for 30 minutes, including several HLS segment boundaries; lock the screen: it continues; the launcher shows a playing state whose stop action ends audio within a second; battery use over 30 minutes with the screen off is documented. Reopening the app returns to the player with the same station still on air.
+
+## Need 4: read the system volume
+
+### Why
+
+Version 0.10.0 gives the player its own volume: a 0–100% slider on the player page, side-key up/right = +10% and down/left = −10% while the player is open (`BOBO_EV_BUTTON`), applied through `bobo_audio_set_volume()`. That is all the SDK allows:
+
+- `include/bobo_app.h` exposes only `void bobo_audio_set_volume(int percent)`; there is no getter for the current system volume and no event when system volume changes (system settings, another app, or the hardware keys before the app opens);
+- there is no `BOBO_CAP_AUDIO_VOLUME` capability bit and no state key that mirrors the system volume (`bobo_state_*` is app-private).
+
+The app therefore keeps its own `live_vol` (persisted in `state.json`, default 100%) and re-applies it on every `bobo_audio_open`; the firmware's documented behavior — system volume restored after the app closes — hides the divergence from the user. But the app cannot:
+
+- start at the user's system volume (the slider may jump the speaker louder or quieter the moment playback starts);
+- show the true current volume when the user changes it outside the app while audio plays;
+- offer a "跟随系统" volume mode, which is what several users expect from a radio.
+
+### Proposed API (API level 9)
+
+```c
+/* Current system output volume, 0–100. Returns -1 if unsupported.
+ * Valid in the foreground before and while the app plays. */
+int bobo_audio_volume(void);
+
+/* Optional: new event delivered while the app runs when system volume
+ * changes (hardware keys claimed by the OS, control center, ducking).
+ * ev.a = new volume percent, 0–100. */
+/* BOBO_EV_VOLUME_CHANGED */
+```
+
+The getter alone is enough for a correct UI: read once when the app opens audio to seed `live_vol` if the user never set it, and the event keeps the slider in sync while playing. No new manifest permission is needed; a capability bit is optional.
+
+### Acceptance sketch
+
+Open a station: the in-app slider shows the same value as the system volume. Press the hardware volume keys: the slider follows via the event while the app's own taps cause exactly one volume change. Press HOME: the system restores the pre-app volume; relaunch and the app again starts at the system value.

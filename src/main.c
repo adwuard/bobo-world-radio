@@ -53,6 +53,13 @@ enum {
   ACT_LANG_ZH,
   ACT_LANG_EN,
   ACT_RESUME,
+  ACT_LIVE_SETTINGS,
+  ACT_SHEET_CLOSE,
+  ACT_VOL_UP,
+  ACT_VOL_DOWN,
+  ACT_VOL_SET,
+  ACT_BOOST,
+  ACT_DENOISE,
 };
 
 typedef struct {
@@ -118,6 +125,7 @@ static uint8_t *live_net;
 static uint8_t *live_ts;
 static char live_seg[MAX_LIVE_SEG][512];
 static char live_seg_tmp[512];
+static uint32_t live_seg_ms[MAX_LIVE_SEG]; /* #EXTINF duration of each entry */
 static int live_seg_count;
 static char live_cur[512];
 static char live_pl_url[768];
@@ -166,6 +174,23 @@ static bool live_stop_req;
 static int live_tune; /* +1 next station, -1 previous, 0 idle */
 static uint32_t back_guard_until;
 
+/* ---- audio controls ------------------------------------------------------
+ * The SDK has a volume setter only, so the app keeps its own level, applies
+ * it on every open and restores it from state. The system volume comes back
+ * when the output closes. Boost and denoise run on the decoded PCM. */
+static int vol_pct = 100;
+static int boost_mode;   /* 0 off, 1 1.2x, 2 1.5x, 3 2x */
+static int denoise_mode; /* 0 off, 1 soft, 2 strong */
+static bool sheet_open;  /* settings sheet over the player */
+
+/* Last measured segment: size in KB and #EXTINF duration in 0.1 s, plus a
+ * smoothed bitrate estimate for the quality rows. */
+static uint32_t live_bitrate;
+static uint32_t live_seg_kb;
+static uint32_t live_seg_x10;
+static float dsp_hp_x[2], dsp_hp_y[2], dsp_env[2];
+static uint32_t dsp_rate;
+
 /* The stream is a session that outlives the player screen: leaving the
  * player keeps it running while the user browses (inside the app only;
  * the system still closes everything on HOME, lock or sleep). */
@@ -190,7 +215,7 @@ static bool live_on_air(void);
 
 static int px(int n) { return screen_w > 600 ? n * 5 / 4 : n; }
 
-#define APP_VERSION "0.9.2"
+#define APP_VERSION "0.10.0"
 
 static const char *T(const char *zh, const char *en) { return ui_en ? en : zh; }
 
@@ -291,7 +316,7 @@ static bool shot_atlas_load(void) {
   if (shot_atlas_tried) return false;
   shot_atlas_tried = true;
   if (!shot_geometry_ok()) return false;
-  size_t cap = screen_w > 600 ? 160 * 1024 : 96 * 1024;
+  size_t cap = screen_w > 600 ? 200 * 1024 : 120 * 1024;
   uint8_t *buf = malloc(cap);
   if (!buf) return false;
   const char *name = screen_w > 600 ? "uifont-684.bin" : "uifont-480.bin";
@@ -974,6 +999,19 @@ static void icon_wave(int x, int y, int s, bool black) {
   }
 }
 
+/* Settings: three faders, so the player header can offer the sheet. */
+static void icon_sliders(int x, int y, int s, bool black) {
+  int xs[3] = {30, 68, 46};
+  for (int i = 0; i < 3; i++) {
+    int ly = y + s * (26 + i * 24) / 100;
+    bobo_draw_line(x + s * 12 / 100, ly, x + s * 88 / 100, ly, 1, black);
+    int kx = x + s * xs[i] / 100;
+    int kh = s * 14 / 100;
+    if (kh < 2) kh = 2;
+    bobo_fill_rect(kx - s / 14, ly - kh / 2, s / 7, kh, black);
+  }
+}
+
 static void icon_clock(int x, int y, int s, bool black) {
   int cx = x + s / 2, cy = y + s / 2, r = s * 42 / 100;
   if (r < 2) return;
@@ -1489,6 +1527,18 @@ static void load_state(void) {
   if (bobo_state_get("live_filter", tmp, sizeof(tmp)) > 0) {
     int f = atoi(tmp);
     if (f >= 0 && f <= 2) live_filter = f;
+  }
+  if (bobo_state_get("live_vol", tmp, sizeof(tmp)) > 0) {
+    int v = atoi(tmp);
+    if (v >= 0 && v <= 100) vol_pct = v;
+  }
+  if (bobo_state_get("live_boost", tmp, sizeof(tmp)) > 0) {
+    int b = atoi(tmp);
+    if (b >= 0 && b <= 3) boost_mode = b;
+  }
+  if (bobo_state_get("live_denoise", tmp, sizeof(tmp)) > 0) {
+    int d = atoi(tmp);
+    if (d >= 0 && d <= 2) denoise_mode = d;
   }
 }
 
@@ -2317,6 +2367,112 @@ static bool live_switch_station(int dir);
 static void live_request_stop(void);
 static void live_start_play(void);
 
+/* ---- software audio stage ------------------------------------------------
+ * Boost multiplies the decoded PCM; denoise high-passes the signal and turns
+ * quiet passages down (a downward expander) so steady hiss fades instead of
+ * riding under the programme. Both are off by default and the decode path is
+ * untouched until one is switched on. */
+
+static void live_dsp_reset(void) {
+  memset(dsp_hp_x, 0, sizeof(dsp_hp_x));
+  memset(dsp_hp_y, 0, sizeof(dsp_hp_y));
+  memset(dsp_env, 0, sizeof(dsp_env));
+  dsp_rate = 0;
+}
+
+static void live_dsp(int16_t *pcm, size_t frames, int ch) {
+  if (!live_hz || (!boost_mode && !denoise_mode)) return;
+  if (dsp_rate != (uint32_t)live_hz) {
+    live_dsp_reset();
+    dsp_rate = (uint32_t)live_hz;
+  }
+  if (ch > 2) ch = 2;
+  const float gain = boost_mode == 3   ? 2.0f
+                     : boost_mode == 2 ? 1.5f
+                     : boost_mode == 1 ? 1.2f
+                                       : 1.0f;
+  const float fc = denoise_mode == 2 ? 180.0f : 120.0f;
+  const float w = 6.2831853f * fc / (float)dsp_rate;
+  const float hp = 1.0f / (1.0f + w);
+  const float thr = denoise_mode == 2 ? 0.008f : 0.003f;
+  const float floor_g = denoise_mode == 2 ? 0.12f : 0.45f;
+  const float attack = 0.35f;
+  const float release = denoise_mode == 2 ? 0.0015f : 0.0008f;
+  for (size_t i = 0; i < frames; i++) {
+    int16_t *fr = pcm + i * (size_t)ch;
+    for (int c = 0; c < ch; c++) {
+      float x = fr[c] / 32768.0f;
+      if (denoise_mode) {
+        float y = hp * (dsp_hp_y[c] + x - dsp_hp_x[c]);
+        dsp_hp_x[c] = x;
+        dsp_hp_y[c] = y;
+        x = y;
+        float ax = x < 0 ? -x : x;
+        float env = dsp_env[c];
+        env += (ax > env ? attack : release) * (ax - env);
+        dsp_env[c] = env;
+        if (env < thr) x *= floor_g + (1.0f - floor_g) * (env / thr);
+      }
+      x *= gain;
+      /* A soft knee above 0.8 keeps a boosted station from clipping hard. */
+      float ax = x < 0 ? -x : x;
+      if (ax > 0.8f) {
+        ax = 0.8f + (ax - 0.8f) / (1.0f + (ax - 0.8f) * 4.0f) * 0.2f;
+        x = x < 0 ? -ax : ax;
+      }
+      fr[c] = (int16_t)(x * 32767.0f);
+    }
+  }
+}
+
+static void live_volume_apply(void) {
+  if (live_audio) bobo_audio_set_volume(vol_pct);
+}
+
+/* The SDK exposes a setter but no getter, so the app owns this level: it is
+ * re-applied after every open and the system volume comes back on close. */
+static void live_set_volume(int pct, bool announce) {
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  if (pct == vol_pct && !announce) return;
+  vol_pct = pct;
+  char b[8];
+  snprintf(b, sizeof(b), "%d", vol_pct);
+  bobo_state_set("live_vol", b);
+  live_volume_apply();
+  if (announce) {
+    snprintf(toast_msg, sizeof(toast_msg), T("音量 %d%%", "VOLUME %d%%"),
+             vol_pct);
+    toast_until = bobo_millis() + 1400;
+  }
+  live_draw(BOBO_REFRESH_FAST);
+}
+
+static void live_set_boost(int mode) {
+  if (mode < 0 || mode > 3 || mode == boost_mode) return;
+  boost_mode = mode;
+  char b[4];
+  snprintf(b, sizeof(b), "%d", boost_mode);
+  bobo_state_set("live_boost", b);
+  live_draw(BOBO_REFRESH_FAST);
+}
+
+static void live_set_denoise(int mode) {
+  if (mode < 0 || mode > 2 || mode == denoise_mode) return;
+  denoise_mode = mode;
+  char b[4];
+  snprintf(b, sizeof(b), "%d", denoise_mode);
+  bobo_state_set("live_denoise", b);
+  live_dsp_reset();
+  live_draw(BOBO_REFRESH_FAST);
+}
+
+static void live_set_sheet(bool open) {
+  if (sheet_open == open) return;
+  sheet_open = open;
+  live_draw(BOBO_REFRESH_HALF);
+}
+
 static void live_cleanup(void) {
   live_close_audio();
   live_active = false;
@@ -2354,8 +2510,24 @@ static int live_fetch(const char *url, size_t *len, uint32_t *ms) {
   return st;
 }
 
+/* #EXTINF:7.000, -> 7000 ms. Zero when the line carries no duration. */
+static uint32_t extinf_ms(const char *s) {
+  uint32_t sec = 0;
+  while (*s >= '0' && *s <= '9') sec = sec * 10 + (uint32_t)(*s++ - '0');
+  uint32_t ms = 0, unit = 100;
+  if (*s == '.') {
+    s++;
+    while (*s >= '0' && *s <= '9' && unit) {
+      ms += (uint32_t)(*s++ - '0') * unit;
+      unit /= 10;
+    }
+  }
+  return sec * 1000 + ms;
+}
+
 static void live_parse_playlist(size_t len) {
   int total = 0;
+  uint32_t pending_ms = 0;
   size_t i = 0;
   while (i < len) {
     size_t j = i;
@@ -2364,9 +2536,13 @@ static void live_parse_playlist(size_t len) {
     if (e > i && live_net[e - 1] == '\r') e--;
     const char *line = (const char *)live_net + i;
     size_t n = e - i;
-    if (n > 0 && line[0] != '#' && n < sizeof(live_seg[0])) {
+    if (n > 7 && !strncmp(line, "#EXTINF:", 8)) {
+      pending_ms = extinf_ms(line + 8);
+    } else if (n > 0 && line[0] != '#' && n < sizeof(live_seg[0])) {
       memcpy(live_seg[total % MAX_LIVE_SEG], line, n);
       live_seg[total % MAX_LIVE_SEG][n] = '\0';
+      live_seg_ms[total % MAX_LIVE_SEG] = pending_ms;
+      pending_ms = 0;
       total++;
     }
     i = j + 1;
@@ -2379,6 +2555,10 @@ static void live_parse_playlist(size_t len) {
       memmove(live_seg[0], live_seg[1],
               sizeof(live_seg[0]) * (MAX_LIVE_SEG - 1));
       memcpy(live_seg[MAX_LIVE_SEG - 1], live_seg_tmp, sizeof(live_seg_tmp));
+      uint32_t d = live_seg_ms[0];
+      memmove(live_seg_ms, live_seg_ms + 1,
+              sizeof(live_seg_ms[0]) * (MAX_LIVE_SEG - 1));
+      live_seg_ms[MAX_LIVE_SEG - 1] = d;
     }
   }
   bobo_log("live: playlist lines=%d keep=%d", total, live_seg_count);
@@ -2528,6 +2708,31 @@ static bool live_on_air(void) {
          live_state == LV_INTERRUPTED || live_state == LV_CONNECTING;
 }
 
+/* A rough listener-side score: state, fetch latency, queue and dropouts.
+ * The SDK has no network-quality call, so these are the numbers the engine
+ * actually observes. */
+static int live_qos_score(void) {
+  int q = 100;
+  if (live_state == LV_ERROR) return 0;
+  if (live_state == LV_BUFFERING) q -= 25;
+  else if (live_state == LV_CONNECTING) q -= 8;
+  else if (live_state == LV_INTERRUPTED) q -= 30;
+  if (live_fetch_ms > 2000) q -= 30;
+  else if (live_fetch_ms > 900) q -= 15;
+  if (live_underruns > 5) q -= 35;
+  else q -= (int)live_underruns * 6;
+  if (live_audio && live_state == LV_PLAYING && bobo_audio_buffered_ms() < 1200)
+    q -= 10;
+  return q < 0 ? 0 : q;
+}
+
+static const char *live_qos_label(int q) {
+  if (q >= 85) return T("优秀", "EXCELLENT");
+  if (q >= 65) return T("良好", "GOOD");
+  if (q >= 40) return T("一般", "FAIR");
+  return T("较差", "POOR");
+}
+
 static void live_close_audio(void) {
   if (live_audio) {
     bobo_audio_close();
@@ -2572,7 +2777,9 @@ static bool ui_handle_event(const bobo_event_t *ev) {
     case BOBO_EV_BUTTON:
       if (ev->button == BOBO_BTN_BACK) {
         if ((int32_t)(back_guard_until - bobo_millis()) > 0) break;
-        if (page == PG_PLAYER) {
+        if (page == PG_PLAYER && sheet_open) {
+          live_set_sheet(false);
+        } else if (page == PG_PLAYER) {
           leave_player();
         } else if (!go_back()) {
           clear_nav();
@@ -2580,6 +2787,14 @@ static bool ui_handle_event(const bobo_event_t *ev) {
           exit_no_save = true;
           app_should_exit = true;
         }
+      } else if (page == PG_PLAYER &&
+                 (ev->button == BOBO_BTN_UP || ev->button == BOBO_BTN_DOWN ||
+                  ev->button == BOBO_BTN_LEFT ||
+                  ev->button == BOBO_BTN_RIGHT)) {
+        /* On the player the side keys are volume keys: the firmware only
+           routes them to the system while background audio plays. */
+        bool up = ev->button == BOBO_BTN_UP || ev->button == BOBO_BTN_RIGHT;
+        live_set_volume(vol_pct + (up ? 10 : -10), true);
       } else if (ev->button == BOBO_BTN_UP || ev->button == BOBO_BTN_LEFT) {
         page_shift(-1);
       } else if (ev->button == BOBO_BTN_DOWN ||
@@ -2894,6 +3109,8 @@ static bool live_open_audio(int hz, int ch) {
   live_route = -1; /* adopt whichever sink this open landed on */
   live_route_ms = bobo_millis();
   live_wd_armed = false;
+  live_volume_apply();
+  live_dsp_reset();
   if (bobo_capabilities() & BOBO_CAP_KEEP_AWAKE) bobo_keep_awake(true);
   /* A channel-count change keeps the queued audio, so it needs no refill;
      a sample-rate change drops it and must be primed again. */
@@ -2918,6 +3135,16 @@ static bool live_play_segment(const char *seg) {
              T("分片下载失败：HTTP %d。", "Segment download failed: HTTP %d."),
              st);
     return false;
+  }
+
+  /* Measured quality: the #EXTINF duration makes bytes/s a real bitrate. */
+  int spat = live_find(seg);
+  uint32_t sdur = spat >= 0 ? live_seg_ms[spat] : 0;
+  live_seg_kb = (uint32_t)((len + 512) / 1024);
+  if (sdur >= 1000) {
+    uint32_t kbps = (uint32_t)((uint64_t)len * 8u / sdur);
+    live_bitrate = live_bitrate ? (live_bitrate * 2 + kbps) / 3 : kbps;
+    live_seg_x10 = (sdur + 50) / 100;
   }
 
   const uint8_t *data = live_net;
@@ -2961,6 +3188,7 @@ static bool live_play_segment(const char *seg) {
     if (n * (size_t)ch > sizeof(live_pcm) / sizeof(live_pcm[0]))
       n = sizeof(live_pcm) / sizeof(live_pcm[0]) / (size_t)ch;
     if (n) {
+      live_dsp(live_pcm, n, ch);
       if (!live_write_paced(live_pcm, n, ch)) return false;
       live_frames += (uint32_t)n;
     }
@@ -3062,6 +3290,143 @@ static void draw_tune_strip(int x, int y, int w, int h) {
   add_hit(x + half, y, w - half, h, ACT_LIVE_NEXT, 0, 0);
 }
 
+/* ---- settings sheet ------------------------------------------------------
+ * A white panel over the lower player: app volume, software boost, denoise
+ * and the numbers the stream actually measured. The full-screen close hit is
+ * added before the controls, so newest-first lookup reaches a control first
+ * and any other tap closes the sheet. */
+
+static void sheet_seg(int x, int y, int w, int h, const char *label, bool on,
+                      int action, int a) {
+  int lh = bobo_line_height(BOBO_FONT_SMALL);
+  int tw = text_w(BOBO_FONT_SMALL, label, true);
+  if (on) {
+    bobo_fill_round_rect(x, y, w, h, px(3), true);
+    bobo_draw_text(BOBO_FONT_SMALL, x + (w - tw) / 2, y + (h - lh) / 2, label,
+                   false, true);
+  } else {
+    bobo_draw_round_rect(x, y, w, h, 1, px(3), true);
+    bobo_draw_text(BOBO_FONT_SMALL, x + (w - tw) / 2, y + (h - lh) / 2, label,
+                   true, false);
+  }
+  add_hit(x, y, w, h, action, a, 0);
+}
+
+static void sheet_segments(const char *label, const char *const *opts, int n,
+                           int current, int x, int right, int y, int h,
+                           int action) {
+  int lh = bobo_line_height(BOBO_FONT_SMALL);
+  bobo_draw_text(BOBO_FONT_SMALL, x, y + (h - lh) / 2, label, true, true);
+  int gap = px(6);
+  int width[4];
+  int total = 0;
+  for (int i = 0; i < n && i < 4; i++) {
+    width[i] = text_w(BOBO_FONT_SMALL, opts[i], true) + px(18);
+    total += width[i] + (i ? gap : 0);
+  }
+  int sx = right - total;
+  for (int i = 0; i < n && i < 4; i++) {
+    sheet_seg(sx, y, width[i], h, opts[i], i == current, action, i);
+    sx += width[i] + gap;
+  }
+}
+
+static void draw_settings_sheet(void) {
+  const int side = px(18);
+  const int pad = px(16);
+  const int w = screen_w - 2 * side;
+  const int x = side + pad;
+  const int right = side + w - pad;
+  const int sh = px(322);
+  const int sy = screen_h - px(12) - sh;
+  add_hit(0, 0, screen_w, screen_h, ACT_SHEET_CLOSE, 0, 0);
+  bobo_fill_rect(side, sy, w, sh, false);
+  bobo_draw_rect(side, sy, w, sh, 2, true);
+
+  int y = sy + px(14);
+  draw_spaced(BOBO_FONT_SMALL, x, y, "AUDIO & QUALITY", 2, true, true);
+  int cs = px(20);
+  int cx = right - cs;
+  bobo_draw_line(cx, y + px(2), cx + cs, y + px(2) + cs, 2, true);
+  bobo_draw_line(cx, y + px(2) + cs, cx + cs, y + px(2), 2, true);
+  add_hit(right - px(34), y - px(8), px(44), px(40), ACT_SHEET_CLOSE, 0, 0);
+
+  y += px(34);
+  bobo_draw_line(x, y, right, y, 1, true);
+  y += px(12);
+
+  bobo_draw_text(BOBO_FONT_SMALL, x, y + px(2), T("音量", "VOLUME"), true,
+                 true);
+  char v[24];
+  snprintf(v, sizeof(v), "%d%%", vol_pct);
+  draw_right(BOBO_FONT_BODY, right, y - px(3), v, true, true);
+  y += px(26);
+
+  int bh = px(28);
+  int bw = px(30);
+  int blh = bobo_line_height(BOBO_FONT_BODY);
+  bobo_draw_rect(x, y, bw, bh, 1, true);
+  bobo_draw_text(BOBO_FONT_BODY, x + (bw - text_w(BOBO_FONT_BODY, "-", true)) / 2,
+                 y + (bh - blh) / 2, "-", true, true);
+  add_hit(x, y, bw, bh, ACT_VOL_DOWN, 0, 0);
+  int plus_x = right - bw;
+  bobo_draw_rect(plus_x, y, bw, bh, 1, true);
+  bobo_draw_text(BOBO_FONT_BODY,
+                 plus_x + (bw - text_w(BOBO_FONT_BODY, "+", true)) / 2,
+                 y + (bh - blh) / 2, "+", true, true);
+  add_hit(plus_x, y, bw, bh, ACT_VOL_UP, 0, 0);
+  int bar_x = x + bw + px(10);
+  int bar_w = plus_x - px(10) - bar_x;
+  int bar_h = px(14);
+  int bar_y = y + (bh - bar_h) / 2;
+  bobo_draw_rect(bar_x, bar_y, bar_w, bar_h, 1, true);
+  int fill = (bar_w - 4) * vol_pct / 100;
+  if (fill > 0) bobo_fill_rect(bar_x + 2, bar_y + 2, fill, bar_h - 4, true);
+  add_hit(bar_x, y, bar_w, bh, ACT_VOL_SET, 0, 0);
+  y += bh + px(12);
+
+  const char *boosts[4] = {T("关", "OFF"), "1.2x", "1.5x", "2x"};
+  sheet_segments(T("增强", "BOOST"), boosts, 4, boost_mode, x, right, y, bh,
+                 ACT_BOOST);
+  y += bh + px(12);
+
+  const char *denoise[3] = {T("关", "OFF"), T("轻", "LOW"), T("强", "HIGH")};
+  sheet_segments(T("降噪", "DENOISE"), denoise, 3, denoise_mode, x, right, y,
+                 bh, ACT_DENOISE);
+  y += bh + px(14);
+
+  bobo_draw_line(x, y, right, y, 1, true);
+  y += px(12);
+  draw_spaced(BOBO_FONT_SMALL, x, y, "NETWORK & QUALITY", 1, true, true);
+  y += px(22);
+
+  int mid = x + (right - x) / 2;
+  char buf[48];
+  int qos = live_qos_score();
+  if (live_bitrate)
+    snprintf(buf, sizeof(buf), "%u kbps", (unsigned)live_bitrate);
+  else
+    snprintf(buf, sizeof(buf), "--");
+  stat_labelled(x, y, T("码率", "BITRATE"), buf);
+  if (live_seg_x10)
+    snprintf(buf, sizeof(buf), "%u.%u s · %u KB",
+             (unsigned)(live_seg_x10 / 10), (unsigned)(live_seg_x10 % 10),
+             (unsigned)live_seg_kb);
+  else
+    snprintf(buf, sizeof(buf), "--");
+  stat_labelled(mid, y, T("分片", "SEGMENT"), buf);
+  y += px(24);
+  snprintf(buf, sizeof(buf), "%d · %s", qos, live_qos_label(qos));
+  stat_labelled(x, y, T("质量", "QoS"), buf);
+  snprintf(buf, sizeof(buf), "%u ms", (unsigned)live_fetch_ms);
+  stat_labelled(mid, y, T("拉流", "FETCH"), buf);
+
+  draw_center_col(BOBO_FONT_SMALL, sy + sh - px(26),
+                  T("音量在退出应用后恢复为系统音量",
+                    "The system volume returns when the app closes"),
+                  true, false);
+}
+
 static void live_paint(void) {
   hit_count = 0;
   bobo_clear();
@@ -3115,9 +3480,23 @@ static void live_paint(void) {
             ACT_LIVE_FAV, live_idx, 0);
   }
 
+  /* Settings faders sit left of the star. */
+  int gear_s = px(20);
+  int gear_x = chip_x -
+               (live_idx >= 0 ? px(16) + px(44) + px(12) : px(16)) - gear_s;
+  icon_sliders(gear_x, y + px(11), gear_s, true);
+  add_hit(gear_x - px(11), y + px(2), px(44), chip_h + px(14),
+          ACT_LIVE_SETTINGS, 0, 0);
+
   draw_radio_art(side + w / 2, y + px(76), w, art_bh, aired, channel, total);
-  draw_center_col(BOBO_FONT_SMALL, y + card - px(27),
-                  "HLS · AAC-LC 64K · 7 s SEGMENTS", true, false);
+  char art_meta[64];
+  if (live_bitrate && live_seg_x10)
+    snprintf(art_meta, sizeof(art_meta),
+             "HLS · AAC-LC · %u kbps · %u.%u s SEG", (unsigned)live_bitrate,
+             (unsigned)(live_seg_x10 / 10), (unsigned)(live_seg_x10 % 10));
+  else
+    snprintf(art_meta, sizeof(art_meta), "HLS · AAC-LC 64K · 7 s SEGMENTS");
+  draw_center_col(BOBO_FONT_SMALL, y + card - px(27), art_meta, true, false);
   y += card + px(10);
 
   /* Station identity: name and meta on the left, local clock on the right. */
@@ -3146,11 +3525,25 @@ static void live_paint(void) {
   y += px(46) + px(14);
 
   /* Signal: state, queue and the counters that explain a dropout. */
-  int sig_h = px(114);
+  int sig_h = px(140);
   bobo_draw_rect(side, y, w, sig_h, 1, true);
   icon_wave(side + px(14), y + px(11), px(12), true);
   draw_spaced(BOBO_FONT_SMALL, side + px(34), y + px(10), "SIGNAL", px(2), true,
               true);
+  if (boost_mode || denoise_mode) {
+    char *tag = live_stat_buf;
+    if (boost_mode && denoise_mode)
+      snprintf(tag, sizeof(live_stat_buf), "%s · %s",
+               boost_mode == 1 ? "1.2x" : boost_mode == 2 ? "1.5x" : "2x",
+               T("降噪", "DENOISE"));
+    else if (boost_mode)
+      snprintf(tag, sizeof(live_stat_buf), "BOOST %s",
+               boost_mode == 1 ? "1.2x" : boost_mode == 2 ? "1.5x" : "2x");
+    else
+      snprintf(tag, sizeof(live_stat_buf), "%s", T("降噪开", "DENOISE"));
+    bobo_draw_text(BOBO_FONT_SMALL, side + px(92), y + px(11), tag, true,
+                   false);
+  }
   char *route = live_stat_buf;
   if (live_audio && live_hz > 0) {
     char rn[40];
@@ -3193,6 +3586,20 @@ static void live_paint(void) {
   stat_labelled(lx, y + px(86), T("拉流", "FETCH"), vb);
   snprintf(vb, sizeof(live_stat_buf), "%u ms", (unsigned)live_decode_ms);
   stat_labelled(c2, y + px(86), T("解码", "DECODE"), vb);
+  if (live_bitrate)
+    snprintf(vb, sizeof(live_stat_buf), "%u kbps", (unsigned)live_bitrate);
+  else
+    snprintf(vb, sizeof(live_stat_buf), "--");
+  stat_labelled(lx, y + px(110), T("码率", "BITRATE"), vb);
+  int qos = live_qos_score();
+  snprintf(vb, sizeof(live_stat_buf), "%d · %s", qos, live_qos_label(qos));
+  stat_labelled(c2, y + px(110), T("质量", "QoS"), vb);
+  if (live_seg_x10)
+    snprintf(vb, sizeof(live_stat_buf), "%u.%u s",
+             (unsigned)(live_seg_x10 / 10), (unsigned)(live_seg_x10 % 10));
+  else
+    snprintf(vb, sizeof(live_stat_buf), "--");
+  stat_labelled(c3, y + px(110), T("分片", "SEG"), vb);
   y += sig_h;
 
   if (live_note[0]) {
@@ -3215,8 +3622,9 @@ static void live_paint(void) {
   add_hit(side, back_y, w, back_h, ACT_LIVE_BACK, 0, 0);
 
   draw_center_col(BOBO_FONT_SMALL, screen_h - px(28),
-                  T("音量跟随系统 · 点按换台", "SYSTEM VOLUME / TAP TO TUNE"),
+                  T("侧键调节音量 · 点按换台", "SIDE KEYS: VOLUME / TAP TO TUNE"),
                   true, false);
+  if (sheet_open) draw_settings_sheet();
   live_last_ui = bobo_millis();
 }
 
@@ -3266,6 +3674,20 @@ static void live_tap(int x, int y) {
       live_fav_toggle(hits[i].a);
       toast_fav(hits[i].a);
       live_draw(BOBO_REFRESH_FAST);
+    } else if (action == ACT_LIVE_SETTINGS) {
+      live_set_sheet(!sheet_open);
+    } else if (action == ACT_SHEET_CLOSE) {
+      live_set_sheet(false);
+    } else if (action == ACT_VOL_UP || action == ACT_VOL_DOWN) {
+      int step = action == ACT_VOL_UP ? 10 : -10;
+      live_set_volume(vol_pct + step, true);
+    } else if (action == ACT_VOL_SET) {
+      int pct = hits[i].w > 0 ? (x - hits[i].x) * 100 / hits[i].w : vol_pct;
+      live_set_volume((pct + 2) / 5 * 5, false);
+    } else if (action == ACT_BOOST) {
+      live_set_boost(hits[i].a);
+    } else if (action == ACT_DENOISE) {
+      live_set_denoise(hits[i].a);
     }
     return;
   }
@@ -3306,6 +3728,7 @@ static bool live_switch_station(int dir) {
   live_streaming = false;
   live_segs = live_frames = live_underruns = 0;
   live_fetch_ms = live_decode_ms = 0;
+  live_bitrate = live_seg_kb = live_seg_x10 = 0;
   live_hz = live_ch = 0;
   live_seg_count = 0;
   live_cur[0] = '\0';
@@ -3313,6 +3736,7 @@ static bool live_switch_station(int dir) {
   live_fail_streak = 0;
   live_target = 0;
   live_last_ui = 0;
+  live_dsp_reset();
   if (keep) {
     live_state = LV_CONNECTING;
     live_want_play = true;
@@ -3405,6 +3829,7 @@ static void live_reset_stream_flags(void) {
   live_wd_armed = false;
   live_segs = live_frames = live_underruns = 0;
   live_fetch_ms = live_decode_ms = 0;
+  live_bitrate = live_seg_kb = live_seg_x10 = 0;
   live_hz = live_ch = 0;
   live_seg_count = 0;
   live_cur[0] = '\0';
@@ -3415,6 +3840,7 @@ static void live_reset_stream_flags(void) {
   live_target = 0;
   live_tune = 0;
   live_stop_req = false;
+  live_dsp_reset();
 }
 
 /* Makes idx the live session, replacing any stream already running. The
@@ -3742,6 +4168,7 @@ static bool go_back(void) {
  * an already stopped session is released. */
 static void leave_player(void) {
   if (page != PG_PLAYER) return;
+  sheet_open = false;
   int idx = live_idx;
   if (!go_back()) {
     page = PG_HOME;
