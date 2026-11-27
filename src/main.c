@@ -22,6 +22,7 @@ enum {
   MAX_LIVE = 260,
   MAX_LIVE_GROUPS = 24,
   MAX_LIVE_SEG = 10,
+  BAD_MAX = 48,
 };
 
 enum {
@@ -60,6 +61,8 @@ enum {
   ACT_VOL_SET,
   ACT_BOOST,
   ACT_DENOISE,
+  ACT_SLEEP,
+  ACT_BUFFER,
 };
 
 typedef struct {
@@ -97,6 +100,9 @@ static bool ui_en;
 
 static char fav_live_raw[4096];
 static char recent_live_raw[640];
+static char bad_raw[BAD_MAX * 9 + 1];
+static uint32_t bad_hash[BAD_MAX];
+static int bad_count;
 static int live_filter; /* 0 all, 1 China, 2 international */
 
 static char last_ref[192];
@@ -146,6 +152,8 @@ static char fav_key_buf[160];
 static char draw_line_buf[192];
 static char player_line[192];
 static char live_stat_buf[64];
+static char sheet_sleep_lbl[40];
+static char player_foot[64];
 static char home_sub_buf[160];
 static char about_desc_buf[256];
 static int list_scratch[MAX_LIVE];
@@ -159,6 +167,7 @@ static int live_idx = -1;
 static char live_note[128];
 static uint32_t live_fetch_ms, live_decode_ms;
 static uint32_t live_segs, live_frames, live_underruns;
+static uint32_t live_retries; /* transport failures retried this session */
 static uint32_t live_last_ui;
 static bool live_priming;
 static bool live_prime_resume;
@@ -176,12 +185,21 @@ static uint32_t back_guard_until;
 
 /* ---- audio controls ------------------------------------------------------
  * The SDK has a volume setter only, so the app keeps its own level, applies
- * it on every open and restores it from state. The system volume comes back
- * when the output closes. Boost and denoise run on the decoded PCM. */
-static int vol_pct = 100;
-static int boost_mode;   /* 0 off, 1 1.2x, 2 1.5x, 3 2x */
-static int denoise_mode; /* 0 off, 1 soft, 2 strong */
-static bool sheet_open;  /* settings sheet over the player */
+ * it on every open and restores it from state. Speaker and Bluetooth keep
+ * separate levels: the same 60 % sounds very different on a headset. Boost
+ * and denoise run on the decoded PCM. */
+static int vol_pct = 100;    /* speaker */
+static int vol_pct_bt = 100; /* Bluetooth headset */
+static int boost_mode;       /* 0 off, 1 1.2x, 2 1.5x, 3 2x */
+static int denoise_mode;     /* 0 off, 1 soft, 2 strong */
+static int buffer_mode;      /* 0 stable, 1 fast, 2 auto: prime + refill */
+static int live_cushion = 1; /* auto depth 0..4, follows fetch speed */
+static bool sheet_open;      /* settings sheet over the player */
+
+/* Sleep timer: wall clock from the moment it is set, session only. Manual
+ * STOP cancels it; expiry stops the stream and says so. */
+static int sleep_min;
+static uint32_t sleep_until;
 
 /* Last measured segment: size in KB and #EXTINF duration in 0.1 s, plus a
  * smoothed bitrate estimate for the quality rows. */
@@ -215,7 +233,7 @@ static bool live_on_air(void);
 
 static int px(int n) { return screen_w > 600 ? n * 5 / 4 : n; }
 
-#define APP_VERSION "0.10.0"
+#define APP_VERSION "0.12.0"
 
 static const char *T(const char *zh, const char *en) { return ui_en ? en : zh; }
 
@@ -1001,14 +1019,17 @@ static void icon_wave(int x, int y, int s, bool black) {
 
 /* Settings: three faders, so the player header can offer the sheet. */
 static void icon_sliders(int x, int y, int s, bool black) {
-  int xs[3] = {30, 68, 46};
+  static const int xs[3] = {32, 68, 46};
+  int lw = s >= 24 ? 2 : 1;
+  int kw = s / 5;
+  if (kw < 3) kw = 3;
+  int kh = s / 6;
+  if (kh < 3) kh = 3;
   for (int i = 0; i < 3; i++) {
-    int ly = y + s * (26 + i * 24) / 100;
-    bobo_draw_line(x + s * 12 / 100, ly, x + s * 88 / 100, ly, 1, black);
+    int ly = y + s * (20 + i * 30) / 100;
+    bobo_draw_line(x + s * 6 / 100, ly, x + s * 94 / 100, ly, lw, black);
     int kx = x + s * xs[i] / 100;
-    int kh = s * 14 / 100;
-    if (kh < 2) kh = 2;
-    bobo_fill_rect(kx - s / 14, ly - kh / 2, s / 7, kh, black);
+    bobo_fill_rect(kx - kw / 2, ly - kh / 2, kw, kh, black);
   }
 }
 
@@ -1038,10 +1059,24 @@ static void icon_star(int x, int y, int s, bool black) {
 }
 
 static void icon_star_outline(int x, int y, int s, bool black) {
-  icon_star(x, y, s, black);
-  int inner = s * 56 / 100;
-  if (inner < 2) return;
-  icon_star(x + (s - inner) / 2, y + (s - inner) / 2, inner, !black);
+  int cx = x + s / 2, cy = y + s / 2;
+  int ro = s * 46 / 100, ri = s * 19 / 100;
+  static const int ox[5] = {0, 95, 59, -59, -95};
+  static const int oy[5] = {-100, -31, 81, 81, -31};
+  static const int ix[5] = {59, 95, 0, -95, -59};
+  static const int iy[5] = {-81, 31, 100, 31, -81};
+  int xs[10], ys[10];
+  for (int i = 0; i < 5; i++) {
+    xs[i * 2] = cx + ox[i] * ro / 100;
+    ys[i * 2] = cy + oy[i] * ro / 100;
+    xs[i * 2 + 1] = cx + ix[i] * ri / 100;
+    ys[i * 2 + 1] = cy + iy[i] * ri / 100;
+  }
+  int lw = s >= 24 ? 2 : 1;
+  for (int i = 0; i < 10; i++) {
+    int j = (i + 1) % 10;
+    bobo_draw_line(xs[i], ys[i], xs[j], ys[j], lw, black);
+  }
 }
 
 static void icon_headphones(int x, int y, int s, bool black) {
@@ -1418,6 +1453,56 @@ static bool live_is_fav(int idx) {
   return key_in_list(fav_live_raw, fav_key_buf);
 }
 
+/* ---- dead stations -------------------------------------------------------
+ * A station that fails a few segments in a row is remembered (a 32-bit hash
+ * of its catalog key, eight hex chars per line) and skipped on the next tune.
+ * The mark clears as soon as it plays a segment again. Hash lines are compact
+ * enough for the state blob, unlike full source URLs. */
+static uint32_t live_bad_hash(int idx) {
+  uint32_t h = 2166136261u;
+  for (const char *p = live[idx].group; *p; p++)
+    h = (h ^ (uint8_t)*p) * 16777619u;
+  for (const char *p = live[idx].name; *p; p++)
+    h = (h ^ (uint8_t)*p) * 16777619u;
+  return h;
+}
+
+static bool live_is_bad(int idx) {
+  if (idx < 0 || idx >= live_count) return false;
+  uint32_t h = live_bad_hash(idx);
+  for (int i = 0; i < bad_count; i++)
+    if (bad_hash[i] == h) return true;
+  return false;
+}
+
+static void live_bad_save(void) {
+  int n = 0;
+  bad_raw[0] = '\0';
+  for (int i = 0; i < bad_count; i++)
+    n += snprintf(bad_raw + n, sizeof(bad_raw) - (size_t)n, "%08x\n",
+                  (unsigned)bad_hash[i]);
+  bobo_state_set("live_bad", bad_raw);
+}
+
+static void live_bad_mark(int idx) {
+  if (idx < 0 || idx >= live_count) return;
+  if (live_is_bad(idx) || bad_count >= BAD_MAX) return;
+  bad_hash[bad_count++] = live_bad_hash(idx);
+  live_bad_save();
+  bobo_log("live: marked bad %s", live[idx].name);
+}
+
+static void live_bad_clear(int idx) {
+  if (idx < 0 || idx >= live_count) return;
+  uint32_t h = live_bad_hash(idx);
+  for (int i = 0; i < bad_count; i++) {
+    if (bad_hash[i] != h) continue;
+    bad_hash[i] = bad_hash[--bad_count];
+    live_bad_save();
+    return;
+  }
+}
+
 static int live_fav_indices(int *out, int max) {
   int count = 0;
   for (int i = 0; i < live_count && count < max; i++)
@@ -1539,6 +1624,28 @@ static void load_state(void) {
   if (bobo_state_get("live_denoise", tmp, sizeof(tmp)) > 0) {
     int d = atoi(tmp);
     if (d >= 0 && d <= 2) denoise_mode = d;
+  }
+  if (bobo_state_get("live_vol_bt", tmp, sizeof(tmp)) > 0) {
+    int v = atoi(tmp);
+    if (v >= 0 && v <= 100) vol_pct_bt = v;
+  }
+  if (bobo_state_get("live_buffer", tmp, sizeof(tmp)) > 0) {
+    int b = atoi(tmp);
+    if (b >= 0 && b <= 2) buffer_mode = b;
+  }
+  bad_count = 0;
+  if (bobo_state_get("live_bad", bad_raw, sizeof(bad_raw)) > 0) {
+    const char *p = bad_raw;
+    while (*p && bad_count < BAD_MAX) {
+      char *e;
+      unsigned long h = strtoul(p, &e, 16);
+      if (e == p) {
+        p++;
+        continue;
+      }
+      if (h) bad_hash[bad_count++] = (uint32_t)h;
+      p = e;
+    }
   }
 }
 
@@ -1668,14 +1775,21 @@ static void draw_live_row(const live_t *l, int idx, int x, int y, int w, int h,
                           bool star) {
   const int lh = bobo_line_height(BOBO_FONT_SMALL);
   bool now = live_active && idx == live_idx && live_on_air();
+  bool bad = live_is_bad(idx);
   const char *live_lbl =
       now ? T("正在播放 >", "ON AIR >") : T("直播 >", "LIVE >");
   int llw = text_w(BOBO_FONT_SMALL, live_lbl, now);
-  draw_ellipsized(BOBO_FONT_BODY, x, y + px(8), w - px(star ? 44 : 8), l->name,
-                  true, true);
+  const char *bad_lbl = T("上次失败", "LAST FAILED");
+  int badw = bad ? text_w(BOBO_FONT_SMALL, bad_lbl, true) + px(10) : 0;
+  draw_ellipsized(BOBO_FONT_BODY, x, y + px(8),
+                  w - px(star ? 44 : 8) - badw, l->name, true, true);
   draw_ellipsized(BOBO_FONT_SMALL, x, y + h - lh - px(11),
                   w - llw - px(30) - (star ? px(40) : 0), l->sub, true, false);
   int right = x + w - (star ? px(36) : 0);
+  if (bad)
+    draw_right(BOBO_FONT_SMALL, right,
+               y + px(8) + (bobo_line_height(BOBO_FONT_BODY) - lh) / 2, bad_lbl,
+               true, false);
   draw_right(BOBO_FONT_SMALL, right, y + h - lh - px(11), live_lbl, true, now);
   if (now) {
     int d = px(7);
@@ -1687,7 +1801,7 @@ static void draw_live_row(const live_t *l, int idx, int x, int y, int w, int h,
   }
   row_basics(x, y, w, h, ACT_LIVE_STATION, idx);
   if (star) {
-    int s = px(17);
+    int s = px(20);
     int sx = x + w - px(6) - s;
     int sy = y + (h - s) / 2;
     if (live_is_fav(idx))
@@ -2425,24 +2539,38 @@ static void live_dsp(int16_t *pcm, size_t frames, int ch) {
   }
 }
 
+static bool vol_on_bt(void) {
+  char rn[40];
+  return bobo_audio_route(rn, sizeof(rn)) == BOBO_AUDIO_ROUTE_HEADSET;
+}
+
+static int live_vol_value(void) { return vol_on_bt() ? vol_pct_bt : vol_pct; }
+
 static void live_volume_apply(void) {
-  if (live_audio) bobo_audio_set_volume(vol_pct);
+  if (live_audio) bobo_audio_set_volume(live_vol_value());
 }
 
 /* The SDK exposes a setter but no getter, so the app owns this level: it is
- * re-applied after every open and the system volume comes back on close. */
+ * re-applied after every open and the system volume comes back on close.
+ * Each output keeps its own slot, so moving to a headset does not blast the
+ * speaker level into it. */
 static void live_set_volume(int pct, bool announce) {
   if (pct < 0) pct = 0;
   if (pct > 100) pct = 100;
-  if (pct == vol_pct && !announce) return;
-  vol_pct = pct;
+  bool bt = vol_on_bt();
+  int cur = bt ? vol_pct_bt : vol_pct;
+  if (pct == cur && !announce) return;
+  if (bt)
+    vol_pct_bt = pct;
+  else
+    vol_pct = pct;
   char b[8];
-  snprintf(b, sizeof(b), "%d", vol_pct);
-  bobo_state_set("live_vol", b);
+  snprintf(b, sizeof(b), "%d", pct);
+  bobo_state_set(bt ? "live_vol_bt" : "live_vol", b);
   live_volume_apply();
   if (announce) {
     snprintf(toast_msg, sizeof(toast_msg), T("音量 %d%%", "VOLUME %d%%"),
-             vol_pct);
+             pct);
     toast_until = bobo_millis() + 1400;
   }
   live_draw(BOBO_REFRESH_FAST);
@@ -2467,6 +2595,51 @@ static void live_set_denoise(int mode) {
   live_draw(BOBO_REFRESH_FAST);
 }
 
+static void live_set_buffer(int mode) {
+  if (mode < 0 || mode > 2 || mode == buffer_mode) return;
+  buffer_mode = mode;
+  char b[4];
+  snprintf(b, sizeof(b), "%d", buffer_mode);
+  bobo_state_set("live_buffer", b);
+  live_draw(BOBO_REFRESH_FAST);
+}
+
+static int sleep_left_min(void) {
+  if (!sleep_min) return 0;
+  int32_t left = (int32_t)(sleep_until - bobo_millis());
+  if (left <= 0) return 0;
+  return (int)((left + 59999) / 60000);
+}
+
+static void sleep_set(int minutes) {
+  if (minutes != 0 && minutes != 15 && minutes != 30 && minutes != 60) return;
+  sleep_min = minutes;
+  sleep_until = minutes > 0 ? bobo_millis() + (uint32_t)minutes * 60000u : 0;
+  if (minutes > 0) {
+    snprintf(toast_msg, sizeof(toast_msg),
+             T("睡眠 %d 分钟后停止播放", "SLEEP IN %d MIN"), minutes);
+    toast_until = bobo_millis() + 1600;
+  }
+  live_draw(BOBO_REFRESH_FAST);
+}
+
+/* Checked from every idle wait and fetch, so the stop lands within a
+ * segment at worst. A session that already ended just drops the timer. */
+static void sleep_tick(void) {
+  if (!sleep_min) return;
+  if ((int32_t)(bobo_millis() - sleep_until) < 0) return;
+  bool was = live_on_air();
+  sleep_min = 0;
+  sleep_until = 0;
+  if (was) {
+    live_request_stop();
+    snprintf(toast_msg, sizeof(toast_msg),
+             T("睡眠定时到，已停止播放", "SLEEP TIMER: STOPPED"));
+    toast_until = bobo_millis() + 2200;
+    live_draw(BOBO_REFRESH_FAST);
+  }
+}
+
 static void live_set_sheet(bool open) {
   if (sheet_open == open) return;
   sheet_open = open;
@@ -2488,6 +2661,18 @@ static void live_cleanup(void) {
   live_ts = NULL;
 }
 
+/* Auto buffer: every fetch's turnaround nudges the cushion one step, so a
+ * slow link tunes itself toward STABLE and a quick one back toward FAST
+ * without the user choosing. Dropouts raise the floor separately. */
+static void live_adapt_cushion(int st, uint32_t ms) {
+  if (buffer_mode != 2) return;
+  if (st < 0 || ms > 2500) {
+    if (live_cushion < 4) live_cushion++;
+  } else if (ms < 700 && live_cushion > 0) {
+    live_cushion--;
+  }
+}
+
 static int live_fetch(const char *url, size_t *len, uint32_t *ms) {
   static const bobo_header_t hdr[] = {
       {"User-Agent", "WorldRadio/0.3"},
@@ -2497,13 +2682,29 @@ static int live_fetch(const char *url, size_t *len, uint32_t *ms) {
   size_t n = 0;
   *len = 0;
   *ms = 0;
-  if (!live_pump()) return -1;
-  if (!live_keep_going()) return -1;
   uint32_t t0 = bobo_millis();
-  int st = bobo_http("GET", url, hdr, 3, NULL, 0, (char *)live_net,
-                     LIVE_NET_CAP, &n);
+  int st = -1;
+  /* -1 is not an HTTP answer but a failed connection or TLS handshake, and
+   * these CDN names resolve to a dozen edges: a second attempt draws a new
+   * address, so most one-off failures never reach the caller. A request
+   * that sat out the 20 s timeout is a dead link, not a bad draw - retrying
+   * it would only double the wait. */
+  for (int attempt = 0; attempt < 2; attempt++) {
+    if (!live_pump()) return -1;
+    if (!live_keep_going()) return -1;
+    uint32_t ta = bobo_millis();
+    n = 0;
+    st = bobo_http("GET", url, hdr, 3, NULL, 0, (char *)live_net,
+                   LIVE_NET_CAP, &n);
+    if (st >= 0) break;
+    uint32_t took = bobo_millis() - ta;
+    if (took >= 4000) break;
+    live_retries++;
+    bobo_log("live: fetch retry %s st=%d took=%u", url, st, (unsigned)took);
+  }
   *ms = bobo_millis() - t0;
   *len = n;
+  live_adapt_cushion(st, *ms);
   live_pump();
   bobo_log("live: fetch %s status=%d bytes=%u ms=%u", url, st, (unsigned)n,
            (unsigned)*ms);
@@ -2719,6 +2920,8 @@ static int live_qos_score(void) {
   else if (live_state == LV_INTERRUPTED) q -= 30;
   if (live_fetch_ms > 2000) q -= 30;
   else if (live_fetch_ms > 900) q -= 15;
+  int retries = (int)(live_retries > 8 ? 8 : live_retries);
+  q -= retries * 2;
   if (live_underruns > 5) q -= 35;
   else q -= (int)live_underruns * 6;
   if (live_audio && live_state == LV_PLAYING && bobo_audio_buffered_ms() < 1200)
@@ -2731,6 +2934,21 @@ static const char *live_qos_label(int q) {
   if (q >= 65) return T("良好", "GOOD");
   if (q >= 40) return T("一般", "FAIR");
   return T("较差", "POOR");
+}
+
+/* bobo_http returns -1 for a failed connection or TLS handshake, and a
+ * request that sat out its 20 s budget surfaces the same way; the measured
+ * time tells them apart. One phrase for every answer keeps the notes and
+ * the sheet consistent and spares the "HTTP -1" confusion. */
+static void live_reason_text(int st, uint32_t ms, char *out, size_t cap) {
+  if (st < 0)
+    snprintf(out, cap, "%s",
+             ms >= 15000 ? T("网络超时", "network timeout")
+                         : T("网络连接失败", "connection failed"));
+  else if (st == 200)
+    snprintf(out, cap, "%s", T("内容为空", "empty response"));
+  else
+    snprintf(out, cap, "HTTP %d", st);
 }
 
 static void live_close_audio(void) {
@@ -2794,7 +3012,7 @@ static bool ui_handle_event(const bobo_event_t *ev) {
         /* On the player the side keys are volume keys: the firmware only
            routes them to the system while background audio plays. */
         bool up = ev->button == BOBO_BTN_UP || ev->button == BOBO_BTN_RIGHT;
-        live_set_volume(vol_pct + (up ? 10 : -10), true);
+        live_set_volume(live_vol_value() + (up ? 10 : -10), true);
       } else if (ev->button == BOBO_BTN_UP || ev->button == BOBO_BTN_LEFT) {
         page_shift(-1);
       } else if (ev->button == BOBO_BTN_DOWN ||
@@ -2847,6 +3065,7 @@ static bool live_pump(void) {
   bobo_event_t ev;
   for (int n = 0; n < 64 && bobo_wait_event(&ev, 0); n++)
     if (!ui_handle_event(&ev)) return false;
+  sleep_tick();
   toast_expire();
   if (dirty) {
     int mode = BOBO_REFRESH_FAST;
@@ -2864,6 +3083,7 @@ static bool live_poll(void) {
   bobo_event_t ev;
   bool ok = true;
   if (bobo_wait_event(&ev, 20)) ok = ui_handle_event(&ev);
+  sleep_tick();
   toast_expire();
   if (dirty) {
     int mode = BOBO_REFRESH_FAST;
@@ -2974,14 +3194,32 @@ static void live_watch_played(void) {
                      "The output went silent; restarting audio...");
 }
 
+/* Stable queues a few seconds of cushion; fast starts sooner and refills at
+ * a lower mark, which feels immediate but breaks up on a poor link. Auto
+ * maps the measured fetch speed onto the same range, cushion 0 behaving like
+ * fast and cushion 2 like stable. */
+static uint32_t live_prime_target(int route) {
+  if (buffer_mode == 1) return route == BOBO_AUDIO_ROUTE_HEADSET ? 2200 : 1000;
+  if (buffer_mode == 2)
+    return (uint32_t)((route == BOBO_AUDIO_ROUTE_HEADSET ? 2200 : 1000) +
+                      live_cushion *
+                          (route == BOBO_AUDIO_ROUTE_HEADSET ? 600 : 500));
+  return route == BOBO_AUDIO_ROUTE_HEADSET ? 3500 : 2000;
+}
+
+static uint32_t live_refill_ms(void) {
+  if (buffer_mode == 1) return 900;
+  if (buffer_mode == 2) return (uint32_t)(900 + live_cushion * 150);
+  return 1500;
+}
+
 /* Holds the output while the host ring fills. A fresh open and a starved
  * buffer are the two moments that break up on a Bluetooth headset; the feed
  * starts again only once a few seconds are queued. */
 static void live_start_prime(uint32_t target_ms, bool resume) {
   if (target_ms == 0) {
     char rn[40];
-    int route = bobo_audio_route(rn, sizeof(rn));
-    target_ms = route == BOBO_AUDIO_ROUTE_HEADSET ? 3500 : 2000;
+    target_ms = live_prime_target(bobo_audio_route(rn, sizeof(rn)));
   }
   live_prime_ms = target_ms;
   live_prime_t0 = bobo_millis();
@@ -3002,9 +3240,34 @@ static bool live_refresh_next(void) {
     if (pst == 200 && pl_len > 0) {
       live_parse_playlist(pl_len);
       int pos = live_find(live_cur);
-      if (pos >= 0 && pos + 1 < live_seg_count) return true;
+      /* The window moved past the last played segment: the caller re-anchors
+       * to the newest entries. */
+      if (pos < 0) return live_seg_count > 0;
+      if (pos + 1 < live_seg_count) return true;
+      /* Same window: the next segment is not published yet. Another fetch
+       * right now only loads the playlist host; the current segment still
+       * holds audio, so look again after it. */
+      return false;
     }
     if (tries < 2) live_wait(500);
+  }
+  return false;
+}
+
+/* Recovery path for a failing segment: a fresh window means a new playlist
+ * connection, and a new URL when the old one aged out. True when live_seg[]
+ * lists something to play. */
+static bool live_recover_window(void) {
+  for (int tries = 0; tries < 2 && live_keep_going(); tries++) {
+    size_t pl_len = 0;
+    uint32_t pl_ms = 0;
+    int st = live_fetch(live_pl_url, &pl_len, &pl_ms);
+    live_fetch_ms = pl_ms;
+    if (st == 200 && pl_len > 0) {
+      live_parse_playlist(pl_len);
+      return live_seg_count > 0;
+    }
+    if (tries < 1) live_wait(500);
   }
   return false;
 }
@@ -3061,8 +3324,9 @@ static bool live_write_paced(const int16_t *buf, size_t frames, int ch) {
           (uint32_t)(bobo_millis() - live_last_prime) >= 2000) {
         live_last_prime = bobo_millis();
         live_underruns++;
+        if (buffer_mode == 2 && live_cushion < 2) live_cushion = 2;
         live_state = LV_BUFFERING;
-        live_start_prime(1500, true);
+        live_start_prime(live_refill_ms(), true);
         live_draw(BOBO_REFRESH_FAST);
         continue;
       }
@@ -3121,6 +3385,15 @@ static bool live_open_audio(int hz, int ch) {
   return true;
 }
 
+/* ADTS is self-synchronising: after a damaged frame the next 0xFFFx header
+ * re-opens the stream, so one bad packet (or a segment truncated by a CDN
+ * edge) does not have to cost the rest of the segment. */
+static int live_adts_scan(const uint8_t *p, int left) {
+  for (int off = 0; left - off > 7; off++)
+    if (p[off] == 0xFF && (p[off + 1] & 0xF6) == 0xF0) return off;
+  return -1;
+}
+
 static bool live_play_segment(const char *seg) {
   if (!live_pump()) return false;
   if (!live_keep_going()) return false;
@@ -3131,9 +3404,10 @@ static bool live_play_segment(const char *seg) {
   live_fetch_ms = ms;
   if (!live_keep_going()) return false;
   if (st != 200 || len < 8) {
+    char why[40];
+    live_reason_text(st, ms, why, sizeof(why));
     snprintf(live_note, sizeof(live_note),
-             T("分片下载失败：HTTP %d。", "Segment download failed: HTTP %d."),
-             st);
+             T("分片下载失败：%s。", "Segment download failed: %s."), why);
     return false;
   }
 
@@ -3166,6 +3440,7 @@ static bool live_play_segment(const char *seg) {
   unsigned char *p = (unsigned char *)data;
   int left = (int)dlen;
   int got = 0;
+  int resyncs = 0;
   uint32_t dec_ms = 0;
   while (left > 7) {
     if (!live_pump()) return false;
@@ -3176,9 +3451,20 @@ static bool live_play_segment(const char *seg) {
     int err = AACDecode(live_dec, &p, &left, live_pcm);
     dec_ms += bobo_millis() - t0;
     if (err) {
-      if (err != ERR_AAC_INDATA_UNDERFLOW)
-        bobo_log("live: decode err=%d left=%d", err, left);
-      break;
+      if (err == ERR_AAC_INDATA_UNDERFLOW) break;
+      bobo_log("live: decode err=%d left=%d", err, left);
+      if (++resyncs > 8) break;
+      /* Skip the byte the decoder stopped on, then look for the next
+       * frame header; a bad frame costs one frame, not the segment. */
+      if (left > 0) {
+        p++;
+        left--;
+      }
+      int off = live_adts_scan(p, left);
+      if (off < 0) break;
+      p += off;
+      left -= off;
+      continue;
     }
     AACFrameInfo fi;
     AACGetLastFrameInfo(live_dec, &fi);
@@ -3200,6 +3486,8 @@ static bool live_play_segment(const char *seg) {
     }
   }
   live_decode_ms = dec_ms;
+  if (resyncs)
+    bobo_log("live: resynced %d bad frame(s)", resyncs);
   if (!got) {
     strcpy(live_note, T("分片里没有可解码的 AAC 帧。",
                           "Segment has no decodable AAC frames."));
@@ -3337,7 +3625,7 @@ static void draw_settings_sheet(void) {
   const int w = screen_w - 2 * side;
   const int x = side + pad;
   const int right = side + w - pad;
-  const int sh = px(322);
+  const int sh = px(402);
   const int sy = screen_h - px(12) - sh;
   add_hit(0, 0, screen_w, screen_h, ACT_SHEET_CLOSE, 0, 0);
   bobo_fill_rect(side, sy, w, sh, false);
@@ -3357,8 +3645,9 @@ static void draw_settings_sheet(void) {
 
   bobo_draw_text(BOBO_FONT_SMALL, x, y + px(2), T("音量", "VOLUME"), true,
                  true);
+  int vp = live_vol_value();
   char v[24];
-  snprintf(v, sizeof(v), "%d%%", vol_pct);
+  snprintf(v, sizeof(v), "%d%% · %s", vp, vol_on_bt() ? "BT" : "SPK");
   draw_right(BOBO_FONT_BODY, right, y - px(3), v, true, true);
   y += px(26);
 
@@ -3380,7 +3669,7 @@ static void draw_settings_sheet(void) {
   int bar_h = px(14);
   int bar_y = y + (bh - bar_h) / 2;
   bobo_draw_rect(bar_x, bar_y, bar_w, bar_h, 1, true);
-  int fill = (bar_w - 4) * vol_pct / 100;
+  int fill = (bar_w - 4) * vp / 100;
   if (fill > 0) bobo_fill_rect(bar_x + 2, bar_y + 2, fill, bar_h - 4, true);
   add_hit(bar_x, y, bar_w, bh, ACT_VOL_SET, 0, 0);
   y += bh + px(12);
@@ -3393,12 +3682,30 @@ static void draw_settings_sheet(void) {
   const char *denoise[3] = {T("关", "OFF"), T("轻", "LOW"), T("强", "HIGH")};
   sheet_segments(T("降噪", "DENOISE"), denoise, 3, denoise_mode, x, right, y,
                  bh, ACT_DENOISE);
+  y += bh + px(12);
+
+  char *sl = sheet_sleep_lbl;
+  if (sleep_min)
+    snprintf(sl, sizeof(sheet_sleep_lbl), T("睡眠 · %d 分", "SLEEP · %d MIN"),
+             sleep_left_min());
+  else
+    snprintf(sl, sizeof(sheet_sleep_lbl), "%s", T("睡眠", "SLEEP"));
+  const char *sleeps[4] = {T("关", "OFF"), T("15分", "15m"), T("30分", "30m"),
+                           T("60分", "60m")};
+  int ssel = sleep_min == 15 ? 1 : sleep_min == 30 ? 2 : sleep_min == 60 ? 3 : 0;
+  sheet_segments(sl, sleeps, 4, ssel, x, right, y, bh, ACT_SLEEP);
   y += bh + px(14);
 
   bobo_draw_line(x, y, right, y, 1, true);
   y += px(12);
   draw_spaced(BOBO_FONT_SMALL, x, y, "NETWORK & QUALITY", 1, true, true);
   y += px(22);
+
+  const char *buffers[3] = {T("稳定", "STABLE"), T("快速", "FAST"),
+                            T("自动", "AUTO")};
+  sheet_segments(T("缓冲", "BUFFER"), buffers, 3, buffer_mode, x, right, y, bh,
+                 ACT_BUFFER);
+  y += bh + px(12);
 
   int mid = x + (right - x) / 2;
   char buf[48];
@@ -3420,6 +3727,14 @@ static void draw_settings_sheet(void) {
   stat_labelled(x, y, T("质量", "QoS"), buf);
   snprintf(buf, sizeof(buf), "%u ms", (unsigned)live_fetch_ms);
   stat_labelled(mid, y, T("拉流", "FETCH"), buf);
+  y += px(24);
+  snprintf(buf, sizeof(buf), "%u", (unsigned)live_retries);
+  stat_labelled(x, y, T("重试", "RETRY"), buf);
+  if (live_audio)
+    snprintf(buf, sizeof(buf), "%u ms", (unsigned)bobo_audio_buffered_ms());
+  else
+    snprintf(buf, sizeof(buf), "--");
+  stat_labelled(mid, y, T("缓冲", "BUFFER"), buf);
 
   draw_center_col(BOBO_FONT_SMALL, sy + sh - px(26),
                   T("音量在退出应用后恢复为系统音量",
@@ -3470,22 +3785,24 @@ static void live_paint(void) {
   /* Favorite star at the top-right of the receiver block: hollow when not
    * saved, solid when saved, and tappable like the list stars. */
   if (live_idx >= 0) {
-    int s = px(22);
-    int sx = chip_x - px(16) - s;
+    int s = px(30);
+    int sx = chip_x - px(12) - s;
+    int sy = y + px(9) + (chip_h - s) / 2;
     if (live_is_fav(live_idx))
-      icon_star(sx, y + px(9), s, true);
+      icon_star(sx, sy, s, true);
     else
-      icon_star_outline(sx, y + px(9), s, true);
-    add_hit(chip_x - px(16) - px(44), y + px(2), px(44), chip_h + px(14),
+      icon_star_outline(sx, sy, s, true);
+    add_hit(chip_x - px(52), y + px(2), px(40), chip_h + px(18),
             ACT_LIVE_FAV, live_idx, 0);
   }
 
   /* Settings faders sit left of the star. */
-  int gear_s = px(20);
-  int gear_x = chip_x -
-               (live_idx >= 0 ? px(16) + px(44) + px(12) : px(16)) - gear_s;
-  icon_sliders(gear_x, y + px(11), gear_s, true);
-  add_hit(gear_x - px(11), y + px(2), px(44), chip_h + px(14),
+  int gear_s = px(30);
+  int gear_x =
+      chip_x - (live_idx >= 0 ? px(12) + px(30) + px(12) : px(12)) - gear_s;
+  int gear_y = y + px(9) + (chip_h - gear_s) / 2;
+  icon_sliders(gear_x, gear_y, gear_s, true);
+  add_hit(gear_x - px(8), y + px(2), px(40), chip_h + px(18),
           ACT_LIVE_SETTINGS, 0, 0);
 
   draw_radio_art(side + w / 2, y + px(76), w, art_bh, aired, channel, total);
@@ -3621,9 +3938,15 @@ static void live_paint(void) {
                  back_lbl, true, true);
   add_hit(side, back_y, w, back_h, ACT_LIVE_BACK, 0, 0);
 
-  draw_center_col(BOBO_FONT_SMALL, screen_h - px(28),
-                  T("侧键调节音量 · 点按换台", "SIDE KEYS: VOLUME / TAP TO TUNE"),
-                  true, false);
+  char *foot = player_foot;
+  if (sleep_min)
+    snprintf(foot, sizeof(player_foot),
+             T("睡眠 %d 分后停止 · 侧键调音量", "SLEEP IN %d MIN · VOLUME KEYS"),
+             sleep_left_min());
+  else
+    snprintf(foot, sizeof(player_foot), "%s",
+             T("侧键调节音量 · 点按换台", "SIDE KEYS: VOLUME / TAP TO TUNE"));
+  draw_center_col(BOBO_FONT_SMALL, screen_h - px(28), foot, true, false);
   if (sheet_open) draw_settings_sheet();
   live_last_ui = bobo_millis();
 }
@@ -3680,20 +4003,42 @@ static void live_tap(int x, int y) {
       live_set_sheet(false);
     } else if (action == ACT_VOL_UP || action == ACT_VOL_DOWN) {
       int step = action == ACT_VOL_UP ? 10 : -10;
-      live_set_volume(vol_pct + step, true);
+      live_set_volume(live_vol_value() + step, true);
     } else if (action == ACT_VOL_SET) {
-      int pct = hits[i].w > 0 ? (x - hits[i].x) * 100 / hits[i].w : vol_pct;
+      int cur = live_vol_value();
+      int pct = hits[i].w > 0 ? (x - hits[i].x) * 100 / hits[i].w : cur;
       live_set_volume((pct + 2) / 5 * 5, false);
     } else if (action == ACT_BOOST) {
       live_set_boost(hits[i].a);
     } else if (action == ACT_DENOISE) {
       live_set_denoise(hits[i].a);
+    } else if (action == ACT_BUFFER) {
+      live_set_buffer(hits[i].a);
+    } else if (action == ACT_SLEEP) {
+      static const int mins[4] = {0, 15, 30, 60};
+      sleep_set(mins[hits[i].a & 3]);
     }
     return;
   }
 }
 
 static int live_target;
+
+/* Playback should stay a couple of segments behind the newest listed one.
+ * Slow fetch bursts slide the window while live_target stands still, so the
+ * gap grows; once it passes LIVE_LAG_MAX the listener is replaying a minute
+ * of backlog, and the loop re-anchors near the edge instead. The jump is
+ * audible but rare, and it bounds the delay after a bad stretch. */
+#define LIVE_LAG_TARGET 2
+#define LIVE_LAG_MAX 6
+
+static void live_lag_anchor(void) {
+  int edge = live_seg_count - 1;
+  if (live_target < 0 || edge < 0 || edge - live_target <= LIVE_LAG_MAX) return;
+  bobo_log("live: lag %d segments, re-anchoring", edge - live_target);
+  live_target = edge - LIVE_LAG_TARGET;
+  if (live_target < 0) live_target = 0;
+}
 
 static void live_reset_decoder(void) {
   if (live_dec) AACFreeDecoder(live_dec);
@@ -3727,6 +4072,7 @@ static bool live_switch_station(int dir) {
   live_reset_decoder();
   live_streaming = false;
   live_segs = live_frames = live_underruns = 0;
+  live_retries = 0;
   live_fetch_ms = live_decode_ms = 0;
   live_bitrate = live_seg_kb = live_seg_x10 = 0;
   live_hz = live_ch = 0;
@@ -3803,15 +4149,20 @@ static bool live_begin_stream(void) {
   if (live_tune) return false;
   if (st == 200) live_parse_playlist(len);
   if (live_seg_count == 0) {
+    char why[40];
+    live_reason_text(st, ms, why, sizeof(why));
     live_state = LV_ERROR;
     snprintf(live_note, sizeof(live_note),
-             T("取不到直播列表（HTTP %d）。点按开始重试。",
-               "No playlist (HTTP %d). Press START to retry."),
-             st);
+             T("取不到直播列表：%s。点按播放重试。",
+               "No playlist: %s. Press PLAY to retry."),
+             why);
     live_draw(BOBO_REFRESH_FAST);
     return false;
   }
-  live_target = live_seg_count >= 2 ? live_seg_count - 2 : live_seg_count - 1;
+  live_target = live_seg_count >= 3
+                    ? live_seg_count - 3
+                    : (live_seg_count >= 2 ? live_seg_count - 2
+                                           : live_seg_count - 1);
   strcpy(live_note,
          T("正在获取第一个分片...", "Fetching the first segment..."));
   live_draw(BOBO_REFRESH_FAST);
@@ -3828,6 +4179,7 @@ static void live_reset_stream_flags(void) {
   live_route_ms = 0;
   live_wd_armed = false;
   live_segs = live_frames = live_underruns = 0;
+  live_retries = 0;
   live_fetch_ms = live_decode_ms = 0;
   live_bitrate = live_seg_kb = live_seg_x10 = 0;
   live_hz = live_ch = 0;
@@ -3944,8 +4296,11 @@ static void live_request_station(int idx) {
   live_session_start(idx);
 }
 
-/* STOP on the player page: silence now, keep the screen. */
+/* STOP on the player page: silence now, keep the screen. A manual stop also
+ * drops the sleep timer - it is meant to end a session, not outlive it. */
 static void live_request_stop(void) {
+  sleep_min = 0;
+  sleep_until = 0;
   live_pending = LIVE_PEND_NONE;
   live_stop_req = true;
   live_want_play = false;
@@ -3996,22 +4351,24 @@ static void live_service_inner(void) {
   while (live_keep_going()) {
     live_watch_route();
     if (!live_keep_going()) break;
-    /* Refresh the window while the buffer is still full: the last listed
-     * segment is about to play, so the next URL is known before the buffer
-     * runs empty. */
-    if (live_audio && live_segs > 0 && live_target + 1 >= live_seg_count &&
+    /* Refresh the window two segments from the end while the buffer is
+     * still full, so the fetch never has to run at the edge with the ring
+     * nearly empty. */
+    if (live_audio && live_segs > 0 && live_target + 2 >= live_seg_count &&
         live_fetch_ms < 3000 && bobo_audio_buffered_ms() >= 1200) {
       snprintf(live_want, sizeof(live_want), "%s", live_seg[live_target]);
       if (live_refresh_next()) {
         int pos = live_find(live_want);
         live_target =
             pos >= 0 ? pos : (live_seg_count >= 2 ? live_seg_count - 2 : 0);
+        live_lag_anchor();
       }
     }
     if (!live_play_segment(live_seg[live_target])) {
       if (!live_keep_going()) break;
       live_fail_streak++;
       if (live_fail_streak >= 5) {
+        live_bad_mark(live_idx);
         live_state = LV_ERROR;
         live_want_play = false;
         live_close_audio();
@@ -4029,10 +4386,26 @@ static void live_service_inner(void) {
         strcpy(live_note, T("网络不稳定，正在重试...",
                             "Network unstable, retrying..."));
       live_draw(BOBO_REFRESH_FAST);
-      live_wait(800);
+      /* After a second failure stop reusing the same URL: ask the source
+       * for a fresh window and retry from it - the same segment when it is
+       * still listed, otherwise the newest one. */
+      if (live_fail_streak >= 2) {
+        snprintf(live_want, sizeof(live_want), "%s", live_seg[live_target]);
+        if (live_recover_window()) {
+          int pos = live_find(live_want);
+          live_target = pos >= 0 ? pos : live_seg_count - 1;
+          live_lag_anchor();
+        }
+      }
+      /* Give a flaky link room to breathe; the first retry stays quick. */
+      static const uint32_t backoff[4] = {500, 800, 1200, 1800};
+      int bi = live_fail_streak - 1;
+      if (bi > 3) bi = 3;
+      live_wait(backoff[bi]);
       continue;
     }
     live_fail_streak = 0;
+    live_bad_clear(live_idx);
     strcpy(live_cur, live_seg[live_target]);
     if (live_segs == 0) {
       remember_live(live_idx);
@@ -4050,6 +4423,7 @@ static void live_service_inner(void) {
       live_target = pos >= 0 && pos + 1 < live_seg_count
                         ? pos + 1
                         : (live_seg_count > 0 ? live_seg_count - 1 : 0);
+      live_lag_anchor();
     } else {
       live_target = live_seg_count > 0 ? live_seg_count - 1 : 0;
     }
@@ -4306,6 +4680,7 @@ int app_main(int argc, char *argv[]) {
 
   for (;;) {
     if (app_should_exit || live_exit) break;
+    sleep_tick();
     toast_expire();
     if (dirty) {
       int mode = first_draw ? BOBO_REFRESH_HALF : BOBO_REFRESH_FAST;
