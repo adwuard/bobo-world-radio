@@ -31,6 +31,7 @@ enum {
   PG_LIVE,
   PG_LIVE_ST,
   PG_ABOUT,
+  PG_PLAYER,
 };
 
 enum {
@@ -75,7 +76,14 @@ static int page_arg;
 static int nav_page[MAX_NAV], nav_arg[MAX_NAV], nav_list[MAX_NAV], nav_depth;
 static int list_first;
 static int page_rows = 5, page_total;
-static bool dirty = true, first_draw = true, app_should_exit;
+static bool dirty = true, first_draw = true, app_should_exit, exit_no_save;
+
+/* A short confirmation ("SAVED · station") drawn over the page, then
+ * repainted away: on e-ink the star change alone is easy to miss. The black
+ * pill needs a HALF refresh to clear without a ghost. */
+static char toast_msg[128];
+static uint32_t toast_until;
+static bool toast_cleared;
 
 static int lang_mode; /* 0 follow system, 1 Chinese, 2 English */
 static bool ui_en;
@@ -154,17 +162,527 @@ static bool live_wd_armed;
 static uint32_t live_wd_t0, live_wd_played;
 static int live_fail_streak;
 static bool live_exit;
-static bool live_quit;
 static bool live_stop_req;
-static bool live_start_req;
 static int live_tune; /* +1 next station, -1 previous, 0 idle */
 static uint32_t back_guard_until;
 
+/* The stream is a session that outlives the player screen: leaving the
+ * player keeps it running while the user browses (inside the app only;
+ * the system still closes everything on HOME, lock or sleep). */
+static bool live_active;    /* decoder and buffers allocated */
+static bool live_want_play; /* the session should be streaming */
+static bool live_streaming; /* playlist fetched, segments listed */
+
+/* A station tap or PLAY handled inside the streaming engine cannot swap the
+ * buffers under the decoder's feet; it waits until the engine unwinds. */
+enum { LIVE_PEND_NONE, LIVE_PEND_START, LIVE_PEND_STATION };
+static int live_pending = LIVE_PEND_NONE;
+static int live_pending_idx = -1;
+static bool live_in_service;
+
+/* True while the session should keep working on the stream. */
+static bool live_keep_going(void) {
+  return live_want_play && !live_exit && !live_stop_req && !live_tune &&
+         !app_should_exit;
+}
+
+static bool live_on_air(void);
+
 static int px(int n) { return screen_w > 600 ? n * 5 / 4 : n; }
 
-#define APP_VERSION "0.8.6"
+#define APP_VERSION "0.9.2"
 
 static const char *T(const char *zh, const char *en) { return ui_en ? en : zh; }
+
+/* ---- screenshot ----------------------------------------------------------
+ * The firmware gives apps no way to read the panel, so the shot is rebuilt:
+ * the current page is drawn a second time into a 1-bit shadow canvas (BMP
+ * stride, bottom row written first later) and saved as a 1-bit BMP under
+ * user/shots/ - which physically lives on the TF card. Glyphs come from
+ * files/uifont-*.bin (rendered by the firmware's own font); pen positions
+ * still use bobo_text_advance, so the rebuilt page breaks lines exactly like
+ * the visible one. Ten taps in the bottom-right corner start it. */
+
+#define SHOT_MAX_W 684
+#define SHOT_MAX_H 1216
+#define SHOT_STRIDE_MAX (((SHOT_MAX_W + 31) / 32) * 4)
+#define SHOT_BMP_HDR 62
+
+/* Both buffers are freed after a shot: the player's 448 KB stream buffer
+ * matters more than a screenshot taken once in a while. */
+static uint8_t *shot_buf;
+static uint8_t *shot_atlas;
+static bool shot_atlas_tried;
+static bool shot_cap;      /* primitives go to the shadow, not the panel */
+static int shot_header_h;  /* real bobo_draw_header height, cached */
+static int shot_taps;
+static uint32_t shot_tap_ms;
+
+/* The corner belongs to the gesture: corner taps never reach the page, so a
+ * streak cannot open a station, flip a page or leave the player on the way
+ * to the shot. Every control that reaches into the corner is still larger
+ * outside it. */
+static bool shot_corner(int x, int y) {
+  int z = px(64);
+  return x >= screen_w - z && y >= screen_h - z;
+}
+
+static void draw_page(int refresh);
+
+static uint16_t shot_rd16(const uint8_t *p) {
+  uint16_t v;
+  memcpy(&v, p, sizeof(v));
+  return v;
+}
+
+static uint32_t shot_rd32(const uint8_t *p) {
+  uint32_t v;
+  memcpy(&v, p, sizeof(v));
+  return v;
+}
+
+static bool shot_geometry_ok(void) {
+  return screen_w > 0 && screen_w <= SHOT_MAX_W && screen_h > 0 &&
+         screen_h <= SHOT_MAX_H;
+}
+
+static int shot_stride(void) { return ((screen_w + 31) / 32) * 4; }
+
+static uint8_t *shot_row(int y) {
+  return shot_buf + SHOT_BMP_HDR + (size_t)y * (size_t)shot_stride();
+}
+
+/* Ink bits are 0, paper 1 - the BMP 1-bit palette order. */
+static void shot_span(int x, int y, int w, bool black) {
+  if (w <= 0 || y < 0 || y >= screen_h) return;
+  if (x < 0) {
+    w += x;
+    x = 0;
+  }
+  if (x + w > screen_w) w = screen_w - x;
+  if (w <= 0) return;
+  uint8_t *row = shot_row(y);
+  int b0 = x >> 3, b1 = (x + w - 1) >> 3;
+  uint8_t m0 = (uint8_t)(0xFFu >> (x & 7));
+  uint8_t m1 = (uint8_t)(0xFFu << (7 - ((x + w - 1) & 7)));
+  if (b0 == b1) {
+    uint8_t mask = (uint8_t)(m0 & m1);
+    if (black)
+      row[b0] &= (uint8_t)~mask;
+    else
+      row[b0] |= mask;
+    return;
+  }
+  if (black)
+    row[b0] &= (uint8_t)~m0;
+  else
+    row[b0] |= m0;
+  if (black)
+    row[b1] &= (uint8_t)~m1;
+  else
+    row[b1] |= m1;
+  if (b1 - b0 > 1) memset(row + b0 + 1, black ? 0x00 : 0xFF, (size_t)(b1 - b0 - 1));
+}
+
+static void shot_px(int x, int y, bool black) { shot_span(x, y, 1, black); }
+
+static bool shot_atlas_load(void) {
+  if (shot_atlas) return true;
+  if (shot_atlas_tried) return false;
+  shot_atlas_tried = true;
+  if (!shot_geometry_ok()) return false;
+  size_t cap = screen_w > 600 ? 160 * 1024 : 96 * 1024;
+  uint8_t *buf = malloc(cap);
+  if (!buf) return false;
+  const char *name = screen_w > 600 ? "uifont-684.bin" : "uifont-480.bin";
+  int n = bobo_file_read(name, buf, cap);
+  bool ok = n >= 44 && memcmp(buf, "WRF2", 4) == 0 && shot_rd16(buf + 4) == 1 &&
+            shot_rd16(buf + 6) == 3;
+  for (int f = 0; ok && f < 3; f++) {
+    uint32_t so = shot_rd32(buf + 8 + f * 4);
+    if ((uint64_t)so + 16 > (uint64_t)n || memcmp(buf + so, "WRF3", 4) != 0) {
+      ok = false;
+      break;
+    }
+    int cnt = shot_rd16(buf + so + 4);
+    if ((uint64_t)so + 16 + (uint64_t)cnt * 8 > (uint64_t)n) {
+      ok = false;
+      break;
+    }
+    for (int i = 0; ok && i < cnt; i++) {
+      uint32_t ro = shot_rd32(buf + so + 16 + i * 8 + 4);
+      if ((uint64_t)so + ro + 4 > (uint64_t)n) {
+        ok = false;
+        break;
+      }
+      const uint8_t *rec = buf + so + ro;
+      uint32_t len = 4u + ((rec[2] + 7u) / 8u) * rec[3];
+      if ((uint64_t)so + ro + len > (uint64_t)n) ok = false;
+    }
+  }
+  if (!ok) {
+    free(buf);
+    bobo_log("shot: atlas %s unusable (%d bytes)", name, n);
+    return false;
+  }
+  shot_atlas = buf;
+  bobo_log("shot: atlas %s %d bytes", name, n);
+  return true;
+}
+
+static const uint8_t *shot_section(int font) {
+  uint32_t so = shot_rd32(shot_atlas + 8 + (uint32_t)font * 4);
+  return shot_atlas + so;
+}
+
+static const uint8_t *shot_glyph(int font, unsigned cp) {
+  if (!shot_atlas || font < 0 || font > 2) return NULL;
+  const uint8_t *sec = shot_section(font);
+  int lo = 0, hi = (int)shot_rd16(sec + 4) - 1;
+  while (lo <= hi) {
+    int mid = (lo + hi) / 2;
+    unsigned c = shot_rd16(sec + 16 + mid * 8);
+    if (c == cp) return sec + shot_rd32(sec + 16 + mid * 8 + 4);
+    if (c < cp)
+      lo = mid + 1;
+    else
+      hi = mid - 1;
+  }
+  return NULL;
+}
+
+/* Record: int8 bx, int8 by, uint8 w, uint8 h, ink rows MSB-first. */
+static void shot_glyph_blit(const uint8_t *rec, int x, int y, bool black) {
+  int bx = (int8_t)rec[0], by = (int8_t)rec[1];
+  int w = rec[2], h = rec[3];
+  const uint8_t *bm = rec + 4;
+  int nb = (w + 7) / 8;
+  for (int yy = 0; yy < h; yy++)
+    for (int xx = 0; xx < w; xx++)
+      if ((bm[yy * nb + (xx >> 3)] >> (7 - (xx & 7))) & 1)
+        shot_px(x + bx + xx, y + by + yy, black);
+}
+
+static int shot_isqrt(int v) {
+  if (v <= 0) return 0;
+  int r = 0;
+  while ((r + 1) * (r + 1) <= v) r++;
+  return r;
+}
+
+/* Row inset of a rounded box: the circle test of the two nearest corners. */
+static int shot_rr_inset(int i, int h, int r) {
+  if (r <= 0) return 0;
+  int dy = i < r ? i : (i >= h - r ? h - 1 - i : r);
+  if (dy >= r) return 0;
+  int d = r - dy;
+  return r - shot_isqrt(r * r - d * d);
+}
+
+static void ui_clear(void) {
+  if (!shot_cap) {
+    bobo_clear();
+    return;
+  }
+  if (!shot_geometry_ok()) return;
+  int stride = shot_stride();
+  for (int y = 0; y < screen_h; y++) memset(shot_row(y), 0xFF, (size_t)stride);
+}
+
+static void ui_fill_rect(int x, int y, int w, int h, bool black) {
+  if (!shot_cap) {
+    bobo_fill_rect(x, y, w, h, black);
+    return;
+  }
+  for (int yy = 0; yy < h; yy++) shot_span(x, y + yy, w, black);
+}
+
+static void ui_draw_rect(int x, int y, int w, int h, int lw, bool black) {
+  if (!shot_cap) {
+    bobo_draw_rect(x, y, w, h, lw, black);
+    return;
+  }
+  if (w <= 0 || h <= 0) return;
+  if (lw < 1) lw = 1;
+  ui_fill_rect(x, y, w, lw, black);
+  ui_fill_rect(x, y + h - lw, w, lw, black);
+  ui_fill_rect(x, y + lw, lw, h - 2 * lw, black);
+  ui_fill_rect(x + w - lw, y + lw, lw, h - 2 * lw, black);
+}
+
+static void ui_fill_round_rect(int x, int y, int w, int h, int r, bool black) {
+  if (!shot_cap) {
+    bobo_fill_round_rect(x, y, w, h, r, black);
+    return;
+  }
+  if (w <= 0 || h <= 0) return;
+  int lim = (w < h ? w : h) / 2;
+  if (r > lim) r = lim;
+  if (r <= 0) {
+    ui_fill_rect(x, y, w, h, black);
+    return;
+  }
+  for (int i = 0; i < h; i++) {
+    int inset = shot_rr_inset(i, h, r);
+    shot_span(x + inset, y + i, w - 2 * inset, black);
+  }
+}
+
+static void ui_draw_round_rect(int x, int y, int w, int h, int lw, int r,
+                               bool black) {
+  if (!shot_cap) {
+    bobo_draw_round_rect(x, y, w, h, lw, r, black);
+    return;
+  }
+  if (w <= 0 || h <= 0) return;
+  if (lw < 1) lw = 1;
+  int lim = (w < h ? w : h) / 2;
+  if (r > lim) r = lim;
+  int ir = r > lw ? r - lw : 0;
+  for (int i = 0; i < h; i++) {
+    int oi = shot_rr_inset(i, h, r);
+    int left = x + oi, right = x + w - oi;
+    if (i >= lw && i < h - lw) {
+      int ii = shot_rr_inset(i - lw, h - 2 * lw, ir);
+      int il = x + lw + ii, irt = x + w - lw - ii;
+      if (il > left) shot_span(left, y + i, il - left, black);
+      if (right > irt) shot_span(irt, y + i, right - irt, black);
+    } else {
+      shot_span(left, y + i, right - left, black);
+    }
+  }
+}
+
+static void shot_line1(int x1, int y1, int x2, int y2, bool black) {
+  int dx = abs(x2 - x1), sx = x1 < x2 ? 1 : -1;
+  int dy = -abs(y2 - y1), sy = y1 < y2 ? 1 : -1;
+  int err = dx + dy;
+  for (;;) {
+    shot_px(x1, y1, black);
+    if (x1 == x2 && y1 == y2) break;
+    int e2 = 2 * err;
+    if (e2 >= dy) {
+      err += dy;
+      x1 += sx;
+    }
+    if (e2 <= dx) {
+      err += dx;
+      y1 += sy;
+    }
+  }
+}
+
+static void ui_draw_line(int x1, int y1, int x2, int y2, int lw, bool black) {
+  if (!shot_cap) {
+    bobo_draw_line(x1, y1, x2, y2, lw, black);
+    return;
+  }
+  if (lw < 1) lw = 1;
+  for (int i = 0; i < lw; i++) shot_line1(x1, y1 + i, x2, y2 + i, black);
+}
+
+static void ui_draw_bitmap(const uint8_t *bits, int w, int h, int x, int y,
+                           bool black) {
+  if (!shot_cap) {
+    bobo_draw_bitmap(bits, w, h, x, y, black);
+    return;
+  }
+  int nb = (w + 7) / 8;
+  for (int yy = 0; yy < h; yy++)
+    for (int xx = 0; xx < w; xx++)
+      if (((bits[yy * nb + (xx >> 3)] >> (7 - (xx & 7))) & 1) == 0)
+        shot_px(x + xx, y + yy, black);
+}
+
+static void ui_draw_text(int font, int x, int y, const char *utf8, bool black,
+                         bool bold) {
+  if (!shot_cap) {
+    bobo_draw_text(font, x, y, utf8, black, bold);
+    return;
+  }
+  const uint8_t *s = (const uint8_t *)utf8;
+  while (*s) {
+    int n = *s >= 0xF0 ? 4 : *s >= 0xE0 ? 3 : *s >= 0xC0 ? 2 : 1;
+    char one[5];
+    unsigned cp;
+    memcpy(one, s, (size_t)n);
+    one[n] = '\0';
+    if (n == 1)
+      cp = *s;
+    else if (n == 2)
+      cp = ((unsigned)(s[0] & 0x1F) << 6) | (s[1] & 0x3F);
+    else if (n == 3)
+      cp = ((unsigned)(s[0] & 0x0F) << 12) | ((unsigned)(s[1] & 0x3F) << 6) |
+           (s[2] & 0x3F);
+    else
+      cp = ((unsigned)(s[0] & 0x07) << 18) | ((unsigned)(s[1] & 0x3F) << 12) |
+           ((unsigned)(s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+    if (cp != ' ') {
+      const uint8_t *rec = shot_glyph(font, cp);
+      if (rec) shot_glyph_blit(rec, x, y, black);
+    }
+    x += bobo_text_advance(font, one, bold);
+    s += n;
+  }
+}
+
+/* The header's pixels are the firmware's, so the shadow redraws its own:
+ * status line, back chevron, title and rule at the cached height. */
+static void shot_header(const char *title, int hh) {
+  const int side = px(24);
+  char clock[8] = "--:--";
+  int64_t t = bobo_time();
+  if (t > 0) {
+    int64_t local = t + bobo_tz_offset();
+    if (local < 0) local = 0;
+    int sec = (int)(local % 86400);
+    snprintf(clock, sizeof(clock), "%02d:%02d", sec / 3600, (sec / 60) % 60);
+  }
+  ui_draw_text(BOBO_FONT_SMALL, side, 4, clock, true, false);
+  const char *wifi = "WIFI";
+  ui_draw_text(BOBO_FONT_SMALL,
+               screen_w - side - bobo_text_width(BOBO_FONT_SMALL, wifi, false),
+               4, wifi, true, false);
+  int lh = bobo_line_height(BOBO_FONT_BODY);
+  ui_draw_text(BOBO_FONT_BODY, side + (screen_w > 600 ? 34 : 30),
+               (hh - lh) / 2 + 4, title, true, true);
+  int ay = hh / 2 + 4, ax = side + 8;
+  ui_draw_line(ax + 12, ay - 9, ax, ay, 2, true);
+  ui_draw_line(ax, ay, ax + 12, ay + 9, 2, true);
+  ui_draw_line(side, hh - 2, screen_w - side, hh - 2, 1, true);
+}
+
+static int ui_draw_header(const char *title) {
+  if (!shot_cap) {
+    int hh = bobo_draw_header(title);
+    if (hh > 0) shot_header_h = hh;
+    return hh;
+  }
+  int hh = shot_header_h > 0 ? shot_header_h : (screen_w > 600 ? 70 : 56);
+  shot_header(title, hh);
+  return hh;
+}
+
+/* From here on every drawing call in the file goes through the wrappers. */
+#define bobo_clear ui_clear
+#define bobo_fill_rect ui_fill_rect
+#define bobo_draw_rect ui_draw_rect
+#define bobo_fill_round_rect ui_fill_round_rect
+#define bobo_draw_round_rect ui_draw_round_rect
+#define bobo_draw_line ui_draw_line
+#define bobo_draw_bitmap ui_draw_bitmap
+#define bobo_draw_text ui_draw_text
+#define bobo_draw_header ui_draw_header
+
+static int shot_next_seq(void) {
+  char b[16];
+  int n = 0;
+  if (bobo_state_get("shot_seq", b, sizeof(b)) > 0) n = atoi(b);
+  n = n % 999 + 1;
+  snprintf(b, sizeof(b), "%d", n);
+  bobo_state_set("shot_seq", b);
+  return n;
+}
+
+static void shot_wr16(uint8_t *p, unsigned v) {
+  p[0] = (uint8_t)v;
+  p[1] = (uint8_t)(v >> 8);
+}
+
+static void shot_wr32(uint8_t *p, uint32_t v) {
+  p[0] = (uint8_t)v;
+  p[1] = (uint8_t)(v >> 8);
+  p[2] = (uint8_t)(v >> 16);
+  p[3] = (uint8_t)(v >> 24);
+}
+
+static bool shot_save_bmp(int seq) {
+  const int stride = shot_stride();
+  const uint32_t data = (uint32_t)stride * (uint32_t)screen_h;
+  const uint32_t file = SHOT_BMP_HDR + data;
+  uint8_t *h = shot_buf;
+  memset(h, 0, SHOT_BMP_HDR);
+  h[0] = 'B';
+  h[1] = 'M';
+  shot_wr32(h + 2, file);
+  shot_wr32(h + 10, SHOT_BMP_HDR);
+  shot_wr32(h + 14, 40);
+  shot_wr32(h + 18, (uint32_t)screen_w);
+  shot_wr32(h + 22, (uint32_t)screen_h);
+  shot_wr16(h + 26, 1);
+  shot_wr16(h + 28, 1);
+  shot_wr32(h + 34, data);
+  shot_wr32(h + 38, 2835);
+  shot_wr32(h + 42, 2835);
+  shot_wr32(h + 46, 2);
+  shot_wr32(h + 50, 2);
+  h[58] = h[59] = h[60] = 255; /* palette: black at 54, white at 58 */
+  uint8_t tmp[SHOT_STRIDE_MAX];
+  for (int a = 0, b = screen_h - 1; a < b; a++, b--) {
+    uint8_t *ra = shot_row(a), *rb = shot_row(b);
+    memcpy(tmp, ra, (size_t)stride);
+    memcpy(ra, rb, (size_t)stride);
+    memcpy(rb, tmp, (size_t)stride);
+  }
+  char name[40];
+  snprintf(name, sizeof(name), "user/shots/shot-%03d.bmp", seq);
+  bool ok = bobo_file_write(name, shot_buf, (size_t)file);
+  bobo_log("shot: %s %s %u bytes", name, ok ? "saved" : "failed",
+           (unsigned)file);
+  return ok;
+}
+
+static bool shot_buf_alloc(void) {
+  if (shot_buf) return true;
+  if (!shot_geometry_ok()) return false;
+  shot_buf = malloc(SHOT_BMP_HDR + (size_t)shot_stride() * (size_t)screen_h);
+  return shot_buf != NULL;
+}
+
+static void shot_release(void) {
+  free(shot_buf);
+  shot_buf = NULL;
+  free(shot_atlas);
+  shot_atlas = NULL;
+  shot_atlas_tried = false;
+}
+
+static void shot_capture(void) {
+  if (!shot_atlas_load() || !shot_buf_alloc()) {
+    shot_release();
+    snprintf(toast_msg, sizeof(toast_msg), "%s",
+             T("截屏失败 · 缺少字形文件", "Screenshot failed - font file missing"));
+    toast_until = bobo_millis() + 2200;
+    dirty = true;
+    return;
+  }
+  shot_cap = true;
+  draw_page(BOBO_REFRESH_FAST);
+  shot_cap = false;
+  int seq = shot_next_seq();
+  bool ok = shot_save_bmp(seq);
+  shot_release();
+  if (ok)
+    snprintf(toast_msg, sizeof(toast_msg),
+             T("已截屏 · shot-%03d", "Screenshot · shot-%03d"), seq);
+  else
+    snprintf(toast_msg, sizeof(toast_msg), "%s",
+             T("截屏保存失败", "Screenshot save failed"));
+  toast_until = bobo_millis() + 2200;
+  dirty = true;
+}
+
+static bool toast_active(void) {
+  return toast_msg[0] != '\0' && (int32_t)(toast_until - bobo_millis()) > 0;
+}
+
+static void toast_expire(void) {
+  if (toast_msg[0] && !toast_active()) {
+    toast_msg[0] = '\0';
+    toast_cleared = true;
+    dirty = true;
+  }
+}
 
 static int utf8_len(unsigned char c) {
   if (c >= 0xF0) return 4;
@@ -226,6 +744,24 @@ static void draw_ellipsized(int font, int x, int y, int width, const char *src,
                             bool black, bool bold) {
   ellipsize(font, src, width, bold, draw_line_buf, sizeof(draw_line_buf));
   bobo_draw_text(font, x, y, draw_line_buf, black, bold);
+}
+
+/* Inverted pill above the bottom controls: readable over any page, and it
+ * exists only while toast_active() so pages repaint clean afterwards. */
+static void draw_toast(void) {
+  if (!toast_active() || shot_cap) return;
+  const int lh = bobo_line_height(BOBO_FONT_SMALL);
+  const int pad = px(16);
+  int w = text_w(BOBO_FONT_SMALL, toast_msg, true) + 2 * pad;
+  int maxw = screen_w - px(48);
+  if (w > maxw) w = maxw;
+  int h = lh + px(16);
+  int x = (screen_w - w) / 2;
+  int y = screen_h - px(96) - h - px(12);
+  if (y < 0) y = 0;
+  bobo_fill_round_rect(x, y, w, h, px(4), true);
+  draw_ellipsized(BOBO_FONT_SMALL, x + pad, y + (h - lh) / 2, w - 2 * pad,
+                  toast_msg, false, true);
 }
 
 static const char *take_line(const char *p, int font, bool bold, int width,
@@ -646,6 +1182,7 @@ static void draw_radio_art(int cx, int case_y, int w, int bh, bool on_air,
 static int fast_refreshes;
 
 static void present(int mode) {
+  if (shot_cap) return; /* shadow redraws never touch the panel */
   if (mode == BOBO_REFRESH_FAST && ++fast_refreshes >= 20) {
     mode = BOBO_REFRESH_HALF;
     fast_refreshes = 0;
@@ -885,6 +1422,17 @@ static void live_fav_toggle(int idx) {
            key_in_list(fav_live_raw, key) ? "on" : "off");
 }
 
+/* Star taps confirm through the toast; the row itself only repaints. */
+static void toast_fav(int idx) {
+  bool on = live_is_fav(idx);
+  const char *what = T(on ? "已收藏" : "已取消收藏", on ? "SAVED" : "REMOVED");
+  if (idx >= 0 && idx < live_count)
+    snprintf(toast_msg, sizeof(toast_msg), "%s · %s", what, live[idx].name);
+  else
+    snprintf(toast_msg, sizeof(toast_msg), "%s", what);
+  toast_until = bobo_millis() + 1600;
+}
+
 static void recent_live_add(int idx) {
   if (idx < 0 || idx >= live_count) return;
   char *key = recent_key_buf;
@@ -1069,25 +1617,36 @@ static void draw_pager(int action, int first, int rows, int total, int y) {
 static void draw_live_row(const live_t *l, int idx, int x, int y, int w, int h,
                           bool star) {
   const int lh = bobo_line_height(BOBO_FONT_SMALL);
-  draw_ellipsized(BOBO_FONT_BODY, x, y + px(8), w - px(star ? 40 : 8), l->name,
+  bool now = live_active && idx == live_idx && live_on_air();
+  const char *live_lbl =
+      now ? T("正在播放 >", "ON AIR >") : T("直播 >", "LIVE >");
+  int llw = text_w(BOBO_FONT_SMALL, live_lbl, now);
+  draw_ellipsized(BOBO_FONT_BODY, x, y + px(8), w - px(star ? 44 : 8), l->name,
                   true, true);
   draw_ellipsized(BOBO_FONT_SMALL, x, y + h - lh - px(11),
-                  w - px(star ? 96 : 64), l->sub, true, false);
-  const char *live_lbl = T("直播 >", "LIVE >");
-  int llw = text_w(BOBO_FONT_SMALL, live_lbl, false);
-  int right = x + w - (star ? px(34) : 0);
-  draw_right(BOBO_FONT_SMALL, right, y + h - lh - px(11), live_lbl, true, false);
-  icon_play(right - llw - px(15), y + h - lh - px(10), px(10), true);
+                  w - llw - px(30) - (star ? px(40) : 0), l->sub, true, false);
+  int right = x + w - (star ? px(36) : 0);
+  draw_right(BOBO_FONT_SMALL, right, y + h - lh - px(11), live_lbl, true, now);
+  if (now) {
+    int d = px(7);
+    bobo_fill_round_rect(right - llw - px(12) - d,
+                         y + h - lh - px(11) + (lh - d) / 2, d, d, d / 2,
+                         true);
+  } else {
+    icon_play(right - llw - px(15), y + h - lh - px(10), px(10), true);
+  }
   row_basics(x, y, w, h, ACT_LIVE_STATION, idx);
   if (star) {
-    int s = px(15);
-    int sx = x + w - s;
+    int s = px(17);
+    int sx = x + w - px(6) - s;
     int sy = y + (h - s) / 2;
     if (live_is_fav(idx))
       icon_star(sx, sy, s, true);
     else
       icon_star_outline(sx, sy, s, true);
-    add_hit(x + w - px(36), y, px(36), h, ACT_LIVE_FAV, idx, 0);
+    /* Full-height and 46 px wide: the glyph alone is an easy miss. */
+    add_hit(x + w - px(46), y + px(4), px(46), h - px(8), ACT_LIVE_FAV, idx,
+            0);
   }
 }
 
@@ -1158,8 +1717,11 @@ static void draw_home(void) {
     y += hero_h + px(20);
   }
 
-  int last_live = last_live_index();
+  int now_idx =
+      live_active && live_idx >= 0 && live_on_air() ? live_idx : -1;
+  int last_live = now_idx >= 0 ? now_idx : last_live_index();
   if (last_live >= 0) {
+    bool on_air = now_idx >= 0;
     int ch = px(58);
     bobo_draw_rect(side, y, w, ch, 1, true);
     int block = px(44);
@@ -1172,11 +1734,12 @@ static void draw_home(void) {
     snprintf(resume_sub, sizeof(home_sub_buf), "%s · %s",
              ui_en ? live_group_en(live[last_live].group)
                    : live[last_live].group,
-             T("上次收听", "LAST PLAYED"));
+             on_air ? T("正在播放", "ON AIR") : T("上次收听", "LAST PLAYED"));
     draw_ellipsized(BOBO_FONT_SMALL, side + block + px(16), y + px(35),
                     w - block - px(94), resume_sub, true, false);
     draw_right(BOBO_FONT_SMALL, side + w - px(14), y + px(21),
-               T("继续 >", "RESUME >"), true, true);
+               on_air ? T("回到 >", "OPEN >") : T("继续 >", "RESUME >"), true,
+               true);
     add_hit(side, y, w, ch, ACT_RESUME, 0, 0);
     y += ch + px(22);
   }
@@ -1696,6 +2259,8 @@ static void draw_data_error(void) {
                  true, false);
 }
 
+static void live_draw(int refresh);
+
 static void draw_page(int refresh) {
   hit_count = 0;
   bobo_clear();
@@ -1721,10 +2286,14 @@ static void draw_page(int refresh) {
     case PG_ABOUT:
       draw_about();
       break;
+    case PG_PLAYER:
+      live_draw(refresh);
+      return;
     default:
       draw_home();
       break;
   }
+  draw_toast();
   present(refresh);
 }
 
@@ -1733,12 +2302,26 @@ static void draw_page(int refresh) {
 #define LIVE_NET_CAP (448 * 1024)
 
 static void live_draw(int refresh);
+static void live_paint(void);
 static void live_tap(int x, int y);
 static void live_close_audio(void);
 static bool live_pump(void);
+static bool ui_handle_event(const bobo_event_t *ev);
+static bool go_back(void);
+static void save_nav(void);
+static void clear_nav(void);
+static void do_action(const hit_t *h);
+static void page_shift(int dir);
+static void leave_player(void);
+static bool live_switch_station(int dir);
+static void live_request_stop(void);
+static void live_start_play(void);
 
 static void live_cleanup(void) {
   live_close_audio();
+  live_active = false;
+  live_want_play = false;
+  live_streaming = false;
   if (live_dec) {
     AACFreeDecoder(live_dec);
     live_dec = NULL;
@@ -1747,7 +2330,6 @@ static void live_cleanup(void) {
   live_net = NULL;
   free(live_ts);
   live_ts = NULL;
-  if (bobo_capabilities() & BOBO_CAP_KEEP_AWAKE) bobo_keep_awake(false);
 }
 
 static int live_fetch(const char *url, size_t *len, uint32_t *ms) {
@@ -1760,7 +2342,7 @@ static int live_fetch(const char *url, size_t *len, uint32_t *ms) {
   *len = 0;
   *ms = 0;
   if (!live_pump()) return -1;
-  if (live_quit || live_exit || live_stop_req) return -1;
+  if (!live_keep_going()) return -1;
   uint32_t t0 = bobo_millis();
   int st = bobo_http("GET", url, hdr, 3, NULL, 0, (char *)live_net,
                      LIVE_NET_CAP, &n);
@@ -1951,40 +2533,91 @@ static void live_close_audio(void) {
     bobo_audio_close();
     live_audio = false;
   }
+  if (bobo_capabilities() & BOBO_CAP_KEEP_AWAKE) bobo_keep_awake(false);
 }
 
-static bool live_handle_event(const bobo_event_t *ev) {
+/* System audio events follow the session, not the screen: an assistant
+ * taking the speaker pauses the stream even while the user browses. */
+static void live_audio_event(const bobo_event_t *ev) {
+  if (ev->button == BOBO_AUDIO_EV_INTERRUPTED && live_on_air()) {
+    live_state = LV_INTERRUPTED;
+    live_intr_t0 = bobo_millis();
+    strcpy(live_note, T("语音助手正在使用扬声器，稍后自动继续。",
+                        "The assistant has the speaker; listening resumes "
+                        "when it is free."));
+    live_draw(BOBO_REFRESH_FAST);
+  } else if (ev->button == BOBO_AUDIO_EV_AVAILABLE &&
+             live_state == LV_INTERRUPTED) {
+    if (bobo_audio_pause(false) == BOBO_AUDIO_OK) {
+      live_state = LV_PLAYING;
+      live_note[0] = '\0';
+      live_route = -1;
+      live_wd_armed = false;
+    }
+    live_draw(BOBO_REFRESH_FAST);
+  }
+}
+
+/* One handler for the whole app. The streaming engine pumps it too, so
+ * navigation, taps and system audio events keep working mid-segment. */
+static bool ui_handle_event(const bobo_event_t *ev) {
   switch (ev->type) {
     case BOBO_EV_EXIT:
       live_exit = true;
       return false;
     case BOBO_EV_REDRAW:
-      live_draw(BOBO_REFRESH_HALF);
+      draw_page(BOBO_REFRESH_HALF);
+      dirty = false;
       break;
     case BOBO_EV_BUTTON:
-      if (ev->button == BOBO_BTN_BACK) live_quit = true;
+      if (ev->button == BOBO_BTN_BACK) {
+        if ((int32_t)(back_guard_until - bobo_millis()) > 0) break;
+        if (page == PG_PLAYER) {
+          leave_player();
+        } else if (!go_back()) {
+          clear_nav();
+          bobo_state_set("resume_live", "");
+          exit_no_save = true;
+          app_should_exit = true;
+        }
+      } else if (ev->button == BOBO_BTN_UP || ev->button == BOBO_BTN_LEFT) {
+        page_shift(-1);
+      } else if (ev->button == BOBO_BTN_DOWN ||
+                 ev->button == BOBO_BTN_RIGHT) {
+        page_shift(1);
+      }
+      break;
+    case BOBO_EV_SWIPE:
+      if (ev->dy < 0)
+        page_shift(1);
+      else if (ev->dy > 0)
+        page_shift(-1);
       break;
     case BOBO_EV_TAP:
-      live_tap(ev->x, ev->y);
+      if (shot_corner(ev->x, ev->y)) {
+        uint32_t now = bobo_millis();
+        if (shot_taps == 0 || (int32_t)(now - shot_tap_ms) > 1600)
+          shot_taps = 0;
+        shot_tap_ms = now;
+        if (++shot_taps >= 10) {
+          shot_taps = 0;
+          shot_capture();
+        }
+        break;
+      }
+      shot_taps = 0;
+      if (page == PG_PLAYER) {
+        live_tap(ev->x, ev->y);
+      } else {
+        for (int i = hit_count - 1; i >= 0; i--) {
+          if (!inside(&hits[i], ev->x, ev->y)) continue;
+          do_action(&hits[i]);
+          break;
+        }
+      }
       break;
     case BOBO_EV_AUDIO:
-      if (ev->button == BOBO_AUDIO_EV_INTERRUPTED && live_on_air()) {
-        live_state = LV_INTERRUPTED;
-        live_intr_t0 = bobo_millis();
-        strcpy(live_note, T("语音助手正在使用扬声器，稍后自动继续。",
-                            "The assistant has the speaker; listening resumes "
-                            "when it is free."));
-        live_draw(BOBO_REFRESH_FAST);
-      } else if (ev->button == BOBO_AUDIO_EV_AVAILABLE &&
-                 live_state == LV_INTERRUPTED) {
-        if (bobo_audio_pause(false) == BOBO_AUDIO_OK) {
-          live_state = LV_PLAYING;
-          live_note[0] = '\0';
-          live_route = -1;
-          live_wd_armed = false;
-        }
-        live_draw(BOBO_REFRESH_FAST);
-      }
+      live_audio_event(ev);
       break;
     default:
       break;
@@ -1993,19 +2626,40 @@ static bool live_handle_event(const bobo_event_t *ev) {
 }
 
 /* Handles everything already queued without waiting. Called right after a
- * blocking fetch and between decoded frames so BACK and STOP react within a
- * frame even mid-segment. */
+ * blocking fetch and between decoded frames so navigation and STOP react
+ * within a frame even mid-segment. */
 static bool live_pump(void) {
   bobo_event_t ev;
   for (int n = 0; n < 64 && bobo_wait_event(&ev, 0); n++)
-    if (!live_handle_event(&ev)) return false;
+    if (!ui_handle_event(&ev)) return false;
+  toast_expire();
+  if (dirty) {
+    int mode = BOBO_REFRESH_FAST;
+    if (toast_cleared) {
+      mode = BOBO_REFRESH_HALF;
+      toast_cleared = false;
+    }
+    draw_page(mode);
+    dirty = false;
+  }
   return true;
 }
 
 static bool live_poll(void) {
   bobo_event_t ev;
-  if (!bobo_wait_event(&ev, 20)) return true;
-  return live_handle_event(&ev);
+  bool ok = true;
+  if (bobo_wait_event(&ev, 20)) ok = ui_handle_event(&ev);
+  toast_expire();
+  if (dirty) {
+    int mode = BOBO_REFRESH_FAST;
+    if (toast_cleared) {
+      mode = BOBO_REFRESH_HALF;
+      toast_cleared = false;
+    }
+    draw_page(mode);
+    dirty = false;
+  }
+  return ok;
 }
 
 /* Drop input still queued when the player closes: a held or repeated BACK
@@ -2019,9 +2673,7 @@ static void live_drain_input(void) {
 
 static void live_wait(uint32_t ms) {
   uint32_t end = bobo_millis() + ms;
-  while (!live_quit && !live_exit && !live_stop_req && !live_tune &&
-         (int32_t)(end - bobo_millis()) > 0)
-    live_poll();
+  while (live_keep_going() && (int32_t)(end - bobo_millis()) > 0) live_poll();
 }
 
 /* Drops the old sink's queue and lets the next decoded frame reopen the
@@ -2063,7 +2715,7 @@ static void live_watch_route(void) {
   /* A2DP setup can make the route flap; wait until it holds still. */
   int stable = 0;
   for (int i = 0; i < 15; i++) {
-    if (live_quit || live_exit || live_stop_req || live_tune) return;
+    if (!live_keep_going()) return;
     live_wait(100);
     char nm[40];
     int rr = bobo_audio_route(nm, sizeof(nm));
@@ -2074,7 +2726,7 @@ static void live_watch_route(void) {
       stable = 0;
     }
   }
-  if (live_quit || live_exit || live_stop_req || live_tune) return;
+  if (!live_keep_going()) return;
   if (r == live_route ||
       (r != BOBO_AUDIO_ROUTE_SPEAKER && r != BOBO_AUDIO_ROUTE_HEADSET))
     return;
@@ -2127,9 +2779,7 @@ static void live_start_prime(uint32_t target_ms, bool resume) {
  * of the window never runs on an empty buffer. True when a segment after
  * live_cur is listed. */
 static bool live_refresh_next(void) {
-  for (int tries = 0;
-       tries < 3 && !live_quit && !live_exit && !live_stop_req && !live_tune;
-       tries++) {
+  for (int tries = 0; tries < 3 && live_keep_going(); tries++) {
     size_t pl_len = 0;
     uint32_t pl_ms = 0;
     int pst = live_fetch(live_pl_url, &pl_len, &pl_ms);
@@ -2147,13 +2797,13 @@ static bool live_refresh_next(void) {
 static bool live_write_paced(const int16_t *buf, size_t frames, int ch) {
   size_t off = 0;
   while (off < frames) {
-    if (live_quit || live_exit || live_stop_req || live_tune) return false;
+    if (!live_keep_going()) return false;
     live_watch_route();
-    if (live_quit || live_exit || live_stop_req || live_tune) return false;
+    if (!live_keep_going()) return false;
     if (!live_audio) return true; /* restarted; the next frame reopens */
     if (live_state == LV_INTERRUPTED) {
       if (!live_pump()) return false;
-      if (live_quit || live_exit || live_stop_req || live_tune) return false;
+      if (!live_keep_going()) return false;
       /* An interruption that never reports available would hold the stream
          forever; try the speaker again every 6 s. */
       if ((uint32_t)(bobo_millis() - live_intr_t0) >= 6000) {
@@ -2187,7 +2837,7 @@ static bool live_write_paced(const int16_t *buf, size_t frames, int ch) {
     size_t k = bobo_audio_write(buf + off * (size_t)ch, frames - off);
     if (!k) {
       if (!live_pump()) return false;
-      if (live_quit || live_exit || live_stop_req || live_tune) return false;
+      if (!live_keep_going()) return false;
       /* A full ring whose position no longer moves is a dead sink too. */
       if (!live_priming && live_state == LV_PLAYING) live_watch_played();
       if (!live_audio) return true; /* restarted; the next frame reopens */
@@ -2229,7 +2879,7 @@ static bool live_open_audio(int hz, int ch) {
   for (int i = 0; rc != BOBO_AUDIO_OK && i < 3; i++) {
     bobo_log("live: audio open retry rc=%d", rc);
     live_wait(400);
-    if (live_quit || live_exit || live_stop_req || live_tune) return false;
+    if (!live_keep_going()) return false;
     rc = bobo_audio_open((uint32_t)hz, ch);
   }
   bobo_log("live: audio open rc=%d hz=%d ch=%d", rc, hz, ch);
@@ -2256,13 +2906,13 @@ static bool live_open_audio(int hz, int ch) {
 
 static bool live_play_segment(const char *seg) {
   if (!live_pump()) return false;
-  if (live_quit || live_exit || live_stop_req || live_tune) return false;
+  if (!live_keep_going()) return false;
   live_make_url(seg);
   size_t len = 0;
   uint32_t ms = 0;
   int st = live_fetch(live_url, &len, &ms);
   live_fetch_ms = ms;
-  if (live_quit || live_exit || live_stop_req || live_tune) return false;
+  if (!live_keep_going()) return false;
   if (st != 200 || len < 8) {
     snprintf(live_note, sizeof(live_note),
              T("分片下载失败：HTTP %d。", "Segment download failed: HTTP %d."),
@@ -2292,9 +2942,9 @@ static bool live_play_segment(const char *seg) {
   uint32_t dec_ms = 0;
   while (left > 7) {
     if (!live_pump()) return false;
-    if (live_quit || live_exit || live_stop_req || live_tune) return false;
+    if (!live_keep_going()) return false;
     live_watch_route();
-    if (live_quit || live_exit || live_stop_req || live_tune) return false;
+    if (!live_keep_going()) return false;
     uint32_t t0 = bobo_millis();
     int err = AACDecode(live_dec, &p, &left, live_pcm);
     dec_ms += bobo_millis() - t0;
@@ -2412,7 +3062,7 @@ static void draw_tune_strip(int x, int y, int w, int h) {
   add_hit(x + half, y, w - half, h, ACT_LIVE_NEXT, 0, 0);
 }
 
-static void live_draw(int refresh) {
+static void live_paint(void) {
   hit_count = 0;
   bobo_clear();
   const int side = px(24);
@@ -2450,6 +3100,19 @@ static void live_draw(int refresh) {
   } else {
     bobo_draw_round_rect(chip_x, y + px(9), chip_w, chip_h, 1, px(3), true);
     bobo_draw_text(BOBO_FONT_SMALL, chip_x + px(10), chip_ty, chip, true, true);
+  }
+
+  /* Favorite star at the top-right of the receiver block: hollow when not
+   * saved, solid when saved, and tappable like the list stars. */
+  if (live_idx >= 0) {
+    int s = px(22);
+    int sx = chip_x - px(16) - s;
+    if (live_is_fav(live_idx))
+      icon_star(sx, y + px(9), s, true);
+    else
+      icon_star_outline(sx, y + px(9), s, true);
+    add_hit(chip_x - px(16) - px(44), y + px(2), px(44), chip_h + px(14),
+            ACT_LIVE_FAV, live_idx, 0);
   }
 
   draw_radio_art(side + w / 2, y + px(76), w, art_bh, aired, channel, total);
@@ -2544,7 +3207,7 @@ static void live_draw(int refresh) {
   int back_y = screen_h - px(96);
   if (back_y < y + px(12)) back_y = y + px(12);
   bobo_draw_rect(side, back_y, w, back_h, 1, true);
-  const char *back_lbl = T("返回列表 BACK", "BACK TO LIST");
+  const char *back_lbl = T("返回 · 继续播放", "BACK · KEEPS PLAYING");
   bobo_draw_text(BOBO_FONT_BODY,
                  side + (w - text_w(BOBO_FONT_BODY, back_lbl, true)) / 2,
                  back_y + (back_h - bobo_line_height(BOBO_FONT_BODY)) / 2,
@@ -2554,45 +3217,58 @@ static void live_draw(int refresh) {
   draw_center_col(BOBO_FONT_SMALL, screen_h - px(28),
                   T("音量跟随系统 · 点按换台", "SYSTEM VOLUME / TAP TO TUNE"),
                   true, false);
-  present(refresh);
   live_last_ui = bobo_millis();
 }
 
+/* Repaints the player in place when it is the visible page; otherwise the
+ * change only marks the current page dirty so its now-playing marks follow. */
+static void live_draw(int refresh) {
+  if (page != PG_PLAYER) {
+    dirty = true;
+    return;
+  }
+  if (toast_cleared) {
+    refresh = BOBO_REFRESH_HALF;
+    toast_cleared = false;
+  }
+  live_paint();
+  draw_toast();
+  present(refresh);
+}
+
+/* Periodic clock/state repaint, player page only: browsing pages must not
+ * flash every time a segment rolls over. */
+static void live_tick(void) {
+  if (page == PG_PLAYER &&
+      (live_last_ui == 0 || bobo_millis() - live_last_ui >= 30000))
+    live_draw(BOBO_REFRESH_FAST);
+}
+
 static void live_tap(int x, int y) {
-  if (live_quit || live_exit) return;
+  if (live_exit) return;
   for (int i = hit_count - 1; i >= 0; i--) {
     if (!inside(&hits[i], x, y)) continue;
     int action = hits[i].action;
     if (action == ACT_LIVE_BACK) {
-      live_quit = true;
+      leave_player();
     } else if (action == ACT_LIVE_PLAY) {
-      if (live_on_air()) {
-        live_stop_req = true;
-        live_close_audio();
-        live_route = -1;
-        live_wd_armed = false;
-        live_priming = false;
-        live_prime_resume = false;
-        live_state = LV_STOPPED;
-        live_note[0] = '\0';
-        live_draw(BOBO_REFRESH_FAST);
-      } else {
-        live_start_req = true;
-        live_state = LV_CONNECTING;
-        strcpy(live_note, T("正在重新连接直播源...",
-                            "Reconnecting to the live stream..."));
-        live_draw(BOBO_REFRESH_FAST);
-      }
+      if (live_on_air())
+        live_request_stop();
+      else
+        live_start_play();
     } else if (action == ACT_LIVE_PREV || action == ACT_LIVE_NEXT) {
-      live_tune = action == ACT_LIVE_NEXT ? 1 : -1;
+      int dir = action == ACT_LIVE_NEXT ? 1 : -1;
+      if (live_want_play)
+        live_tune = dir; /* the engine unwinds and retunes */
+      else
+        live_switch_station(dir);
+    } else if (action == ACT_LIVE_FAV) {
+      live_fav_toggle(hits[i].a);
+      toast_fav(hits[i].a);
+      live_draw(BOBO_REFRESH_FAST);
     }
     return;
   }
-}
-
-static int live_wait_fatal(void) {
-  while (!live_quit && !live_exit) live_poll();
-  return live_exit ? 1 : 0;
 }
 
 static int live_target;
@@ -2603,7 +3279,7 @@ static void live_reset_decoder(void) {
 }
 
 /* Moves to the next/previous station inside the same group and rebuilds the
- * stream state. Returns true when the player should keep streaming. */
+ * stream state. Returns true when the session should keep streaming. */
 static bool live_switch_station(int dir) {
   int g = live_group_of(live_idx);
   int first = live_group_first[g];
@@ -2627,6 +3303,7 @@ static bool live_switch_station(int dir) {
     snprintf(live_pl_url, sizeof(live_pl_url), "%s", live[ni].source);
   url_set_base(live_pl_url);
   live_reset_decoder();
+  live_streaming = false;
   live_segs = live_frames = live_underruns = 0;
   live_fetch_ms = live_decode_ms = 0;
   live_hz = live_ch = 0;
@@ -2638,10 +3315,12 @@ static bool live_switch_station(int dir) {
   live_last_ui = 0;
   if (keep) {
     live_state = LV_CONNECTING;
+    live_want_play = true;
     strcpy(live_note, T("正在切换电台...", "Tuning the station..."));
     bobo_state_set("resume_live", live[ni].source);
   } else {
     live_state = LV_STOPPED;
+    live_want_play = false;
     bobo_state_set("resume_live", "");
   }
   live_draw(BOBO_REFRESH_FAST);
@@ -2679,7 +3358,7 @@ static bool live_begin_stream(void) {
   uint32_t ms = 0;
   int st = 0;
   for (int tries = 0; tries < 3; tries++) {
-    if (live_quit || live_exit || live_stop_req || live_tune) return false;
+    if (!live_keep_going()) return false;
     st = live_fetch(live_pl_url, &len, &ms);
     if (st == 200 && len > 0) break;
     live_wait(800);
@@ -2690,7 +3369,7 @@ static bool live_begin_stream(void) {
            T("正在连接直播源...", "Connecting to the live stream..."));
     live_draw(BOBO_REFRESH_FAST);
     for (int tries = 0; tries < 3; tries++) {
-      if (live_quit || live_exit || live_stop_req || live_tune) return false;
+      if (!live_keep_going()) return false;
       st = live_fetch(live_pl_url, &len, &ms);
       if (st == 200 && len > 0) break;
       live_wait(800);
@@ -2715,14 +3394,8 @@ static bool live_begin_stream(void) {
   return true;
 }
 
-static int live_run(int idx) {
-  if (idx < 0 || idx >= live_count) return 0;
-  live_idx = idx;
-  live_quit = false;
-  live_exit = false;
-  live_stop_req = false;
-  live_start_req = false;
-  live_audio = false;
+static void live_reset_stream_flags(void) {
+  live_close_audio();
   live_priming = false;
   live_prime_resume = false;
   live_last_prime = 0;
@@ -2741,7 +3414,19 @@ static int live_run(int idx) {
   live_fail_streak = 0;
   live_target = 0;
   live_tune = 0;
+  live_stop_req = false;
+}
 
+/* Makes idx the live session, replacing any stream already running. The
+ * session keeps going when the player screen is left; the main loop services
+ * it. */
+static void live_session_start(int idx) {
+  if (idx < 0 || idx >= live_count) return;
+  live_pending = LIVE_PEND_NONE;
+  live_pending_idx = -1;
+  if (live_active) live_cleanup();
+  live_reset_stream_flags();
+  live_idx = idx;
   live_dec = AACInitDecoder();
   live_net = malloc(LIVE_NET_CAP);
   live_ts = malloc(LIVE_NET_CAP);
@@ -2749,158 +3434,210 @@ static int live_run(int idx) {
     live_state = LV_ERROR;
     strcpy(live_note, T("内存不足，无法准备直播解码。",
                         "Not enough memory to prepare the decoder."));
-    live_draw(BOBO_REFRESH_HALF);
-    int rc = live_wait_fatal();
-    live_cleanup();
-    return rc;
+    if (live_dec) {
+      AACFreeDecoder(live_dec);
+      live_dec = NULL;
+    }
+    free(live_net);
+    live_net = NULL;
+    free(live_ts);
+    live_ts = NULL;
+    live_active = false;
+    live_want_play = false;
+    dirty = true;
+    return;
   }
-
-  if (!strncmp(live[idx].source, "qt:", 3)) {
+  if (!strncmp(live[idx].source, "qt:", 3))
     snprintf(live_pl_url, sizeof(live_pl_url),
              "https://ls.qingting.fm/live/%s.m3u8?bitrate=64",
              live[idx].source + 3);
-  } else {
+  else
     snprintf(live_pl_url, sizeof(live_pl_url), "%s", live[idx].source);
-  }
   url_set_base(live_pl_url);
+  live_active = true;
+  live_want_play = true;
+  live_streaming = false;
   bobo_state_set("resume_live", live[idx].source);
+  dirty = true;
+}
 
-  live_draw(BOBO_REFRESH_HALF);
+/* PLAY on the player page: restart the stream for the shown station. */
+static void live_start_play_now(void) {
+  if (live_idx < 0) return;
+  if (!live_active) {
+    live_session_start(live_idx);
+    return;
+  }
+  live_reset_stream_flags();
+  live_reset_decoder();
+  if (!live_dec) {
+    live_state = LV_ERROR;
+    strcpy(live_note, T("无法重新初始化解码器，请返回后重试。",
+                        "Could not restart the decoder; go back and retry."));
+    live_draw(BOBO_REFRESH_FAST);
+    return;
+  }
+  strcpy(live_note, T("正在重新连接直播源...",
+                      "Reconnecting to the live stream..."));
+  bobo_state_set("resume_live", live[live_idx].source);
+  live_want_play = true;
+  live_streaming = false;
+  live_draw(BOBO_REFRESH_FAST);
+}
 
-  bool want_play = true;
+static void live_start_play(void) {
+  if (live_idx < 0) return;
+  if (live_in_service) {
+    live_pending = LIVE_PEND_START;
+    live_want_play = true;
+    live_stop_req = true; /* unwind first; the main loop restarts */
+    return;
+  }
+  live_start_play_now();
+}
+
+/* Makes idx the station to play next; from inside the engine it only asks
+ * the engine to unwind and leaves the restart to the main loop. */
+static void live_request_station(int idx) {
+  if (idx < 0 || idx >= live_count) return;
+  if (live_active && live_idx == idx && live_want_play) return;
+  if (!live_active) {
+    live_session_start(idx);
+    return;
+  }
+  if (live_in_service) {
+    live_pending = LIVE_PEND_STATION;
+    live_pending_idx = idx;
+    live_want_play = true;
+    live_stop_req = true;
+    live_close_audio();
+    live_state = LV_CONNECTING;
+    live_note[0] = '\0';
+    return;
+  }
+  live_session_start(idx);
+}
+
+/* STOP on the player page: silence now, keep the screen. */
+static void live_request_stop(void) {
+  live_pending = LIVE_PEND_NONE;
+  live_stop_req = true;
+  live_want_play = false;
+  live_streaming = false;
+  live_close_audio();
+  live_priming = false;
+  live_prime_resume = false;
+  live_route = -1;
+  live_wd_armed = false;
+  if (live_state != LV_ERROR) live_state = LV_STOPPED;
+  live_note[0] = '\0';
+  bobo_state_set("resume_live", "");
+  live_draw(BOBO_REFRESH_FAST);
+}
+
+/* Runs the live session until it is stopped, tuned or fails. While it plays
+ * it pumps ui_handle_event, so browsing, BACK and STOP keep working without
+ * the player owning the app. */
+static void live_service_inner(void) {
+  if (!live_active || !live_want_play) return;
+
   for (;;) {
+    if (!live_want_play) return;
     if (live_tune) {
       int dir = live_tune;
       live_tune = 0;
-      want_play = live_switch_station(dir);
-      if (live_quit || live_exit) break;
-    }
-    bool streaming = want_play ? live_begin_stream() : false;
-    if (streaming) {
-      while (!live_quit && !live_exit && !live_stop_req && !live_tune) {
-        live_watch_route();
-        if (live_quit || live_exit || live_stop_req || live_tune) break;
-        /* Refresh the window while the buffer is still full: the last listed
-         * segment is about to play, so the next URL is known before the
-         * buffer runs empty. */
-        if (live_audio && live_segs > 0 && live_target + 1 >= live_seg_count &&
-            live_fetch_ms < 3000 && bobo_audio_buffered_ms() >= 1200) {
-          snprintf(live_want, sizeof(live_want), "%s", live_seg[live_target]);
-          if (live_refresh_next()) {
-            int pos = live_find(live_want);
-            live_target =
-                pos >= 0 ? pos : (live_seg_count >= 2 ? live_seg_count - 2 : 0);
-          }
-        }
-        if (!live_play_segment(live_seg[live_target])) {
-          if (live_quit || live_exit || live_stop_req || live_tune) break;
-          live_fail_streak++;
-          if (live_fail_streak >= 5) {
-            live_state = LV_ERROR;
-            strcpy(live_note,
-                   T("连续取流失败，点按开始重试。",
-                     "Stream failed five times. Press START to retry."));
-            live_draw(BOBO_REFRESH_FAST);
-            break;
-          }
-          live_state = LV_BUFFERING;
-          if (!live_note[0])
-            strcpy(live_note, T("网络不稳定，正在重试...",
-                                "Network unstable, retrying..."));
-          live_draw(BOBO_REFRESH_FAST);
-          live_wait(800);
-          continue;
-        }
-        live_fail_streak = 0;
-        strcpy(live_cur, live_seg[live_target]);
-        if (live_segs == 0) {
-          remember_live(live_idx);
-          recent_live_add(live_idx);
-        }
-        live_segs++;
-        if (live_audio) live_note[0] = '\0';
-        if (live_audio && live_state != LV_INTERRUPTED)
-          live_state = LV_PLAYING;
-        if (live_last_ui == 0 || bobo_millis() - live_last_ui >= 30000)
-          live_draw(BOBO_REFRESH_FAST);
-
-        if (live_target + 1 < live_seg_count) {
-          live_target++;
-        } else if (live_refresh_next()) {
-          int pos = live_find(live_cur);
-          live_target = pos >= 0 && pos + 1 < live_seg_count
-                            ? pos + 1
-                            : (live_seg_count > 0 ? live_seg_count - 1 : 0);
-        } else {
-          live_target = live_seg_count > 0 ? live_seg_count - 1 : 0;
-        }
-      }
-    }
-    if (live_quit || live_exit) break;
-    if (live_tune) continue;
-
-    if (live_stop_req) {
-      live_stop_req = false;
-      live_close_audio();
-      bobo_state_set("resume_live", "");
-      live_state = LV_STOPPED;
-      live_note[0] = '\0';
-      live_draw(BOBO_REFRESH_FAST);
-    }
-    want_play = false;
-
-    /* Idle on the player page: the clock keeps ticking and START/BACK stay
-     * responsive without any network or audio work. */
-    while (!live_quit && !live_exit && !live_start_req && !live_tune) {
-      live_poll();
-      if (live_stop_req) live_stop_req = false;
-      if (bobo_millis() - live_last_ui >= 30000) live_draw(BOBO_REFRESH_FAST);
-      bobo_delay(30);
-    }
-    if (live_quit || live_exit) break;
-    if (live_tune) continue;
-    live_start_req = false;
-    want_play = true;
-    bobo_state_set("resume_live", live[live_idx].source);
-
-    live_reset_decoder();
-    if (!live_dec) {
-      live_state = LV_ERROR;
-      strcpy(live_note, T("无法重新初始化解码器，请返回后重试。",
-                          "Could not restart the decoder; go back and retry."));
-      live_draw(BOBO_REFRESH_FAST);
+      if (!live_switch_station(dir)) return;
       continue;
     }
-    live_segs = live_frames = live_underruns = 0;
-    live_fetch_ms = live_decode_ms = 0;
-    live_hz = live_ch = 0;
-    live_state = LV_CONNECTING;
-    strcpy(live_note, T("正在重新连接直播源...",
-                        "Reconnecting to the live stream..."));
-    live_draw(BOBO_REFRESH_FAST);
+    if (live_streaming) break;
+    if (!live_begin_stream()) {
+      if (live_tune) continue;
+      if (live_pending != LIVE_PEND_NONE || live_stop_req) return;
+      if (!live_want_play) return;
+      live_want_play = false;
+      if (live_state != LV_ERROR) {
+        live_state = LV_ERROR;
+        strcpy(live_note, T("取不到直播列表。点按播放重试。",
+                            "No playlist. Press PLAY to retry."));
+      }
+      live_draw(BOBO_REFRESH_FAST);
+      return;
+    }
+    live_streaming = true;
+    break;
   }
 
-  /* Leave the station list scrolled to the station that played last. */
-  bool listed_here =
-      page_arg == -1 ? live_group_is_cn(live[live_idx].group)
-                     : page_arg == live_group_of(live_idx);
-  if (!live_exit && page == PG_LIVE_ST && live_idx >= 0 && page_rows > 0 &&
-      listed_here) {
-    int base = page_arg == -1 ? 0 : live_group_first[page_arg];
-    int pos = live_idx - base;
-    if (pos >= 0) list_first = (pos / page_rows) * page_rows;
+  while (live_keep_going()) {
+    live_watch_route();
+    if (!live_keep_going()) break;
+    /* Refresh the window while the buffer is still full: the last listed
+     * segment is about to play, so the next URL is known before the buffer
+     * runs empty. */
+    if (live_audio && live_segs > 0 && live_target + 1 >= live_seg_count &&
+        live_fetch_ms < 3000 && bobo_audio_buffered_ms() >= 1200) {
+      snprintf(live_want, sizeof(live_want), "%s", live_seg[live_target]);
+      if (live_refresh_next()) {
+        int pos = live_find(live_want);
+        live_target =
+            pos >= 0 ? pos : (live_seg_count >= 2 ? live_seg_count - 2 : 0);
+      }
+    }
+    if (!live_play_segment(live_seg[live_target])) {
+      if (!live_keep_going()) break;
+      live_fail_streak++;
+      if (live_fail_streak >= 5) {
+        live_state = LV_ERROR;
+        live_want_play = false;
+        live_close_audio();
+        live_priming = false;
+        live_prime_resume = false;
+        live_route = -1;
+        live_wd_armed = false;
+        strcpy(live_note, T("连续取流失败，点按播放重试。",
+                            "Stream failed five times. Press PLAY to retry."));
+        live_draw(BOBO_REFRESH_FAST);
+        break;
+      }
+      live_state = LV_BUFFERING;
+      if (!live_note[0])
+        strcpy(live_note, T("网络不稳定，正在重试...",
+                            "Network unstable, retrying..."));
+      live_draw(BOBO_REFRESH_FAST);
+      live_wait(800);
+      continue;
+    }
+    live_fail_streak = 0;
+    strcpy(live_cur, live_seg[live_target]);
+    if (live_segs == 0) {
+      remember_live(live_idx);
+      recent_live_add(live_idx);
+    }
+    live_segs++;
+    if (live_audio) live_note[0] = '\0';
+    if (live_audio && live_state != LV_INTERRUPTED) live_state = LV_PLAYING;
+    live_tick();
+
+    if (live_target + 1 < live_seg_count) {
+      live_target++;
+    } else if (live_refresh_next()) {
+      int pos = live_find(live_cur);
+      live_target = pos >= 0 && pos + 1 < live_seg_count
+                        ? pos + 1
+                        : (live_seg_count > 0 ? live_seg_count - 1 : 0);
+    } else {
+      live_target = live_seg_count > 0 ? live_seg_count - 1 : 0;
+    }
   }
 
+  live_stop_req = false;
   bobo_log("live: stop segs=%u frames=%u underruns=%u", (unsigned)live_segs,
            (unsigned)live_frames, (unsigned)live_underruns);
-  bool user_quit = live_quit;
-  if (!live_exit) {
-    live_drain_input();
-    if (!live_exit) back_guard_until = bobo_millis() + 700;
-  }
-  if (user_quit || !live_exit) bobo_state_set("resume_live", "");
-  live_cleanup();
-  return live_exit ? 1 : 0;
+}
+
+static void live_service(void) {
+  live_in_service = true;
+  live_service_inner();
+  live_in_service = false;
 }
 
 /* ---- navigation --------------------------------------------------------- */
@@ -3001,6 +3738,35 @@ static bool go_back(void) {
   return true;
 }
 
+/* BACK on the player: the session keeps playing while the user browses. Only
+ * an already stopped session is released. */
+static void leave_player(void) {
+  if (page != PG_PLAYER) return;
+  int idx = live_idx;
+  if (!go_back()) {
+    page = PG_HOME;
+    page_arg = 0;
+    list_first = 0;
+    nav_depth = 0;
+  }
+  /* Leave the station list scrolled to the station that is playing. */
+  if (page == PG_LIVE_ST && idx >= 0 && page_rows > 0) {
+    bool listed_here = page_arg == -1 ? live_group_is_cn(live[idx].group)
+                                      : page_arg == live_group_of(idx);
+    if (listed_here) {
+      int base = page_arg == -1 ? 0 : live_group_first[page_arg];
+      int pos = idx - base;
+      if (pos >= 0) list_first = (pos / page_rows) * page_rows;
+    }
+  }
+  if (!live_want_play) live_cleanup();
+  live_drain_input();
+  back_guard_until = bobo_millis() + 700;
+  live_last_ui = 0;
+  save_nav();
+  dirty = true;
+}
+
 static void page_shift(int dir) {
   if (page != PG_FAVS && page != PG_RECENT && page != PG_LIVE &&
       page != PG_LIVE_ST)
@@ -3026,6 +3792,7 @@ static void do_action(const hit_t *h) {
       break;
     case ACT_LIVE_FAV:
       live_fav_toggle(h->a);
+      toast_fav(h->a);
       dirty = true;
       break;
     case ACT_LIVE_FILTER: {
@@ -3047,7 +3814,8 @@ static void do_action(const hit_t *h) {
       nav(PG_LIVE_ST, h->a);
       break;
     case ACT_LIVE_STATION:
-      if (live_run(h->a)) app_should_exit = true;
+      nav(PG_PLAYER, 0);
+      live_request_station(h->a);
       dirty = true;
       break;
     case ACT_ABOUT:
@@ -3064,10 +3832,11 @@ static void do_action(const hit_t *h) {
       break;
     }
     case ACT_RESUME: {
-      int li = last_live_index();
+      int li = live_active && live_idx >= 0 ? live_idx : last_live_index();
       if (li >= 0) {
         nav(PG_LIVE_ST, live_group_of(li));
-        if (live_run(li)) app_should_exit = true;
+        nav(PG_PLAYER, 0);
+        live_request_station(li);
       }
       dirty = true;
       break;
@@ -3103,59 +3872,49 @@ int app_main(int argc, char *argv[]) {
       page = PG_HOME;
       nav_depth = 0;
       nav(PG_LIVE_ST, live_group_of(rl));
-      if (live_run(rl)) app_should_exit = true;
+      nav(PG_PLAYER, 0);
+      live_session_start(rl);
     }
   }
 
   for (;;) {
-    if (app_should_exit) {
-      save_nav();
-      return 0;
-    }
+    if (app_should_exit || live_exit) break;
+    toast_expire();
     if (dirty) {
       int mode = first_draw ? BOBO_REFRESH_HALF : BOBO_REFRESH_FAST;
+      if (!first_draw && toast_cleared) {
+        mode = BOBO_REFRESH_HALF;
+        toast_cleared = false;
+      }
       draw_page(mode);
       first_draw = false;
       dirty = false;
     }
-    bobo_event_t ev;
-    if (!bobo_wait_event(&ev, 60000)) continue;
-    switch (ev.type) {
-      case BOBO_EV_EXIT:
-        save_nav();
-        return 0;
-      case BOBO_EV_REDRAW:
-        draw_page(BOBO_REFRESH_HALF);
-        break;
-      case BOBO_EV_BUTTON:
-        if (ev.button == BOBO_BTN_BACK) {
-          if ((int32_t)(back_guard_until - bobo_millis()) > 0) break;
-          if (!go_back()) {
-            clear_nav();
-            return 0;
-          }
-        } else if (ev.button == BOBO_BTN_UP || ev.button == BOBO_BTN_LEFT) {
-          page_shift(-1);
-        } else if (ev.button == BOBO_BTN_DOWN ||
-                   ev.button == BOBO_BTN_RIGHT) {
-          page_shift(1);
-        }
-        break;
-      case BOBO_EV_SWIPE:
-        if (ev.dy < 0)
-          page_shift(1);
-        else if (ev.dy > 0)
-          page_shift(-1);
-        break;
-      case BOBO_EV_TAP:
-        for (int i = hit_count - 1; i >= 0; i--) {
-          if (!inside(&hits[i], ev.x, ev.y)) continue;
-          do_action(&hits[i]);
-          break;
-        }
-        break;
-      default:
-        break;
+    if (live_pending != LIVE_PEND_NONE) {
+      int p = live_pending;
+      live_pending = LIVE_PEND_NONE;
+      if (p == LIVE_PEND_START)
+        live_start_play_now();
+      else
+        live_session_start(live_pending_idx);
+      continue;
     }
+    if (live_active && live_want_play) {
+      live_service();
+      continue;
+    }
+    if (page == PG_PLAYER) live_tick();
+    bobo_event_t ev;
+    uint32_t wait_ms = page == PG_PLAYER ? 1000 : 60000;
+    if (toast_msg[0]) {
+      int32_t left = (int32_t)(toast_until - bobo_millis());
+      if (left < 0) left = 0;
+      if ((uint32_t)left + 20 < wait_ms) wait_ms = (uint32_t)left + 20;
+    }
+    if (!bobo_wait_event(&ev, wait_ms)) continue;
+    if (!ui_handle_event(&ev)) break;
   }
+  live_cleanup();
+  if (!exit_no_save) save_nav();
+  return 0;
 }
